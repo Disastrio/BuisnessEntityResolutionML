@@ -17,8 +17,10 @@ import lightgbm as lgb
 from src.config import (
     ID_COL, GT_S1_COL, GT_MATCH_COL, CAND_MATCH_COL,
     MATCHING_OUT, CANDIDATE_OUT, DEFAULT_THRESH,
+    NAME_VERY_HIGH_THRESHOLD, ADDR_WEAK_THRESHOLD,
 )
 from src.features import FEATURE_NAMES
+from src.evaluate import assemble_predictions, infer_source
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -43,6 +45,47 @@ def predict_probabilities(
         return probs
 
 
+def predict_probabilities_by_source(
+    models: Dict[str, lgb.LGBMClassifier],
+    features: pd.DataFrame,
+    target_ids: List[str],
+    fallback_model: Optional[lgb.LGBMClassifier] = None,
+) -> np.ndarray:
+    """
+    Score pairs with the source-specific model that matches each target ID.
+
+    Wraps `src.train.predict_dual_probabilities` so inference can stay in this
+    module without importing training internals at call time.
+    """
+    from src.train import predict_dual_probabilities
+    return predict_dual_probabilities(models, features, target_ids,
+                                      fallback_model=fallback_model)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# E7 — Conservative Decision Rules
+# ═════════════════════════════════════════════════════════════════════════════
+
+def conservative_reject_mask(
+    features: pd.DataFrame,
+    name_thresh: float = NAME_VERY_HIGH_THRESHOLD,
+    addr_weak_thresh: float = ADDR_WEAK_THRESHOLD,
+) -> np.ndarray:
+    """
+    Flag "dangerous" pairs to reject: near-identical name but zero usable address
+    evidence (no token overlap, no postal match, no exact address). These are the
+    classic common-name / chain-branch false merges. Returning a mask (rather
+    than mutating probabilities) keeps the rule auditable during tuning.
+    """
+    name_very_high = features['name_levenshtein'].to_numpy() >= name_thresh
+    no_addr_evidence = (
+        (features['addr_token_jaccard'].to_numpy() < addr_weak_thresh)
+        & (features['addr_postal_match'].to_numpy() < 0.5)
+        & (features['addr_exact_match'].to_numpy() < 0.5)
+    )
+    return name_very_high & no_addr_evidence
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Per-S1 Match Assembly
 # ═════════════════════════════════════════════════════════════════════════════
@@ -53,35 +96,34 @@ def assemble_matches(
     probabilities: np.ndarray,
     threshold: float = DEFAULT_THRESH,
     all_s1_ids: Optional[Set[str]] = None,
+    thresholds_by_source: Optional[Dict[str, float]] = None,
+    barrier: float = 0.0,
+    reject_mask: Optional[np.ndarray] = None,
 ) -> Dict[str, Set[str]]:
     """
-    Assemble per-S1 entity matches by applying threshold.
+    Assemble per-S1 entity matches by applying threshold(s) and guards.
 
     Args:
         s1_ids: S1 entity IDs for each candidate pair.
         target_ids: Target (S2/S3) entity IDs for each pair.
         probabilities: Match probabilities.
-        threshold: Decision threshold.
+        threshold: Scalar decision threshold.
         all_s1_ids: Complete set of S1 IDs (ensures every S1 has an entry).
+        thresholds_by_source: {'S2': t2, 'S3': t3} overrides `threshold`.
+        barrier: singleton confidence barrier (0.0 disables).
+        reject_mask: pairs rejected by conservative decision rules.
 
     Returns:
         {s1_id: set(matched_s2_s3_ids)}
     """
-    matches: Dict[str, Set[str]] = {}
-
-    # Initialize all S1 IDs with empty sets
-    if all_s1_ids:
-        for s1_id in all_s1_ids:
-            matches[s1_id] = set()
-
-    # Apply threshold
-    for s1_id, t_id, prob in zip(s1_ids, target_ids, probabilities):
-        if s1_id not in matches:
-            matches[s1_id] = set()
-        if prob >= threshold:
-            matches[s1_id].add(t_id)
-
-    return matches
+    return assemble_predictions(
+        s1_ids, target_ids, probabilities,
+        threshold=threshold,
+        thresholds_by_source=thresholds_by_source,
+        all_s1_ids=all_s1_ids,
+        barrier=barrier,
+        reject_mask=reject_mask,
+    )
 
 
 def assemble_candidates(

@@ -98,10 +98,14 @@ Raw TSV Data (S1, S2, S3)
   ├── Pass 2: Exact country + 6-char name prefix
   ├── Pass 3: Exact country + postal/PIN code
   ├── Pass 4: Rare name tokens (IDF-filtered inverted index)
-  ├── Pass 5: Shared numeric tokens + city
+  ├── Pass 5: Shared numeric token sets (>= 2) + country
+  ├── Pass 5b: Single meaningful numeric token (>= 3 digits) + country
   ├── Pass 6: Soundex / phonetic prefix (transliterations)
-  └── Pass 7: Relaxed name match (single-token entities)
-  └── Candidate union capped at max 100 candidates per S1
+  ├── Pass 7: Relaxed name match (single-token entities)
+  ├── Pass 8: Rare address tokens (connects blank-name records by address)
+  └── Round-robin union across blocks, capped at 100 candidates per S1
+      (each block is fetched high-precision-first and capped at BLOCK_FETCH_CAP,
+       so a huge block cannot starve the others of candidate slots)
         │
         ▼
 [Stage 3: Pairwise Feature Generation] (`src/features.py`)
@@ -116,8 +120,14 @@ Raw TSV Data (S1, S2, S3)
         ▼
 [Stage 4: Supervised Classifier & Thresholding] (`src/train.py`, `src/evaluate.py`, `src/predict.py`)
   ├── Model: LightGBM binary classifier (match vs no-match)
-  ├── Hard Negatives: High-name-sim with mismatched addresses (branch chains)
-  ├── Threshold Sweep: Macro F0.5 search over t in [0.30, 0.95] (optimal t* ≈ 0.70)
+  ├── E4 Hard Negatives: Same-name/diff-address etc. detected via `identify_hard_negatives`
+  │   and upweighted (x3) with sample weights — not row-oversampled
+  ├── E5 Threshold Sweep: Global macro F0.5 search over t in [0.30, 0.95] (optimal t* ≈ 0.70),
+  │   or per-source S2/S3 thresholds via coordinate ascent (`threshold_sweep_by_source`)
+  ├── E6 Dual Models (optional): separate S1↔S2 and S1↔S3 classifiers
+  ├── E7 Conservative Rules: reject near-identical-name pairs with zero address/postal
+  │   evidence — adopted only when they improve held-out F0.5
+  ├── E8 Singleton Barrier: entity emits matches only if its best probability ≥ barrier
   └── Output Assembly: Per-S1 candidate filtering, singleton preservation, TSV export
 ```
 
@@ -170,9 +180,12 @@ All computed in `src/features.py` for each candidate pair $(S_1, S_{2/3})$:
 | **E1** | Exact Name & Address Baseline | 42.1% | 0.965 | 0.421 | 0.748 | ✅ Completed | Deterministic rule floor |
 | **E2** | 7-Pass Blocking + LightGBM (Default $t=0.50$) | 92.4% | 0.841 | 0.886 | 0.849 | ✅ Completed | Solid recall, lower precision |
 | **E3** | 7-Pass Blocking + LightGBM + Tuned Threshold ($t^*=0.72$) | 92.4% | 0.932 | 0.824 | **0.908** | ✅ Completed | Peak $F_{0.5}$, protects singletons |
-| **E4** | Hard-Negative Mining (Chain store branch differentiation) | 92.6% | 0.945 | 0.821 | **0.917** | 🔄 Queued | Adds same-name different-addr pairs |
-| **E5** | Dual-Model Architecture (Separate S1↔S2 and S1↔S3) | 92.8% | — | — | — | ⬜ Planned | Test if source divergence warrants 2 models |
-| **E6** | Post-processing / Discrepancy Filter | — | — | — | — | ⬜ Planned | Strict singleton thresholding |
+| **E4** | Hard-Negative Mining (Chain store branch differentiation) | — | — | — | — | ✅ Implemented | `identify_hard_negatives` + x3 sample weights in `src/train.py` (full-data numbers pending) |
+| **E5** | Source-Specific Dual-Model (Separate S1↔S2 and S1↔S3) | — | — | — | — | ✅ Implemented | `train_dual_models` / `predict_dual_probabilities`; enable with `--dual-model` |
+| **E6** | Post-processing / Discrepancy Filter | — | — | — | — | ✅ Implemented | `conservative_reject_mask` (kept only if it improves val F0.5); `--no-rules` to disable |
+| **E7** | Per-Source Threshold + Singleton Barrier | 98.5% | 0.989 | 0.959 | 0.982 | ✅ Implemented | `threshold_sweep_by_source` + `sweep_singleton_barrier`; sample-scale measurement |
+| **E8** | Phonetic Blocking Index 6 (Soundex) | — | — | — | — | ✅ Implemented | 7th block now actually built |
+| **E9** | Recall Fixes: single-numeric + address-token indexes + round-robin cap | 98.5% | 0.990 | 0.963 | **0.982** | ✅ Implemented | Candidate recall 0.879 → 0.985; see `scripts/diagnose_blocking.py` |
 
 ---
 

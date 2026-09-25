@@ -247,7 +247,7 @@ Here is how the repository is structured and what each file does:
 | `ROADMAP.md` | Planning | Deep dive into architecture routes, milestone progress, and risk mitigations. |
 | `CONTEXT.md` | Assistant Rules | Authoritative rules of engagement, data schemas, and feature logs. |
 | `README.md` | Repo Guide | Setup instructions, CLI commands, and reproduction steps. |
-| `problemstatment.md` | Official Prompt | The raw problem statement from the Amazon challenge organizers. |
+| `problem_statement.md` | Official Prompt | The problem statement from the Amazon challenge organizers. |
 | `src/config.py` | Configuration | Paths, random seeds (`SEED=42`), constants, and tuned thresholds. |
 | `src/io.py` | Ingestion | Safe TSV loading, ground truth parsing, and aligned sub-sampling. |
 | `src/normalize.py` | Stage 1 | Unicode NFKD de-accenting, legal suffix expansion, address parsing. |

@@ -9,14 +9,19 @@
 ## 🔴 CURRENT STATUS
 
 ```
-Phase:         CORE PIPELINE IMPLEMENTED & SYSTEM INTEGRATED
+Phase:         MODEL ADVANCED & VALIDATED ON SAMPLE (E4-E8 + blocking recall fixes)
 Modules:       src/normalize.py, src/blocking.py, src/features.py, src/train.py,
                src/predict.py, src/evaluate.py, src/pipeline.py (All built & unit tested)
-Best Val F0.5: ~0.908 (E3: 7-Pass Blocking + LightGBM + Tuned Threshold t*=0.72)
+Measured F0.5: 0.9818 on a streaming aligned 3,000-S1 sample (600 held-out S1 entities),
+               up from 0.9465 on the same sample before the blocking-recall fixes.
+               (The 0.908 E3 figure was never reproduced here — see experiment log.)
 Best Model:    LightGBM pairwise binary classifier with RapidFuzz similarity features
-Next Action:   -> Performance optimization for 24M scale & full test inference validation
+Next Action:   -> Scale the validated config to the largest sample RAM allows, then run
+               full test inference and the official validator before packaging
 Roadmap:       See ROADMAP.md for phase-by-phase execution plan
 Explainer:     See PROJECT_EXPLAINER.md for intuitive plain-English system guide
+Verification:  python scripts/test_model_improvements.py  (34 synthetic checks, all pass)
+Diagnostics:   python scripts/diagnose_blocking.py [n_s1]  (why true matches are missed)
 ```
 
 ---
@@ -234,11 +239,13 @@ Why:
 | E1 | **Exact name match baseline** — normalized name exact OR name+address exact | ✅ Completed | 0.748 | Deterministic floor (high precision, low recall ~42%) |
 | E2 | **7-Pass Blocking + LightGBM (Default t=0.50)** | ✅ Completed | 0.849 | 28 similarity features, high recall (92.4%), moderate precision |
 | E3 | **7-Pass Blocking + LightGBM + Tuned Threshold (t*=0.72)** | ✅ Completed | **0.908** | Precision-weighted threshold sweep peak; preserves singletons |
-| E4 | **Hard-negative training** — same name diff address, branch store discrimination | 🔄 In Progress | target ~0.92 | Crucial for discriminating retail/bank branches |
-| E5 | **Threshold tuning by country/source** — separate threshold for S2 vs S3 | ⬜ TODO | — | Accounts for varying source noise levels |
-| E6 | **Source-specific dual models** — separate S1↔S2 vs S1↔S3 models | ⬜ TODO | — | Compare against unified model with source indicator |
-| E7 | **Conservative decision rules** — require name_high AND address_numeric_match | ⬜ TODO | — | Hard rule against multi-branch false positive merges |
-| E8 | **Singleton-aware tuning** — explicit empty-prediction confidence barrier | ⬜ TODO | — | Maximize singleton 1.0 scores (5.6% of entities) |
+| E4 | **Hard-negative training** — same name diff address, branch store discrimination | ✅ Implemented | part of E10 | `identify_hard_negatives` + sample-weight upweight (x3) in `src/train.py` |
+| E5 | **Threshold tuning by source** — separate threshold for S2 vs S3 | ✅ Implemented | 0.9820 | `threshold_sweep_by_source` coordinate ascent; `--source-thresholds` |
+| E6 | **Source-specific dual models** — separate S1↔S2 vs S1↔S3 models | ✅ Implemented | 0.9820 | `train_dual_models` + `predict_dual_probabilities`; `--dual-model` |
+| E7 | **Conservative decision rules** — reject high-name / no-address pairs | ✅ Implemented | auto-declined | `conservative_reject_mask`; correctly rejected (did not beat baseline) |
+| E8 | **Singleton-aware tuning** — empty-prediction confidence barrier | ✅ Implemented | no change | `sweep_singleton_barrier`; baseline already at 1.0 singleton accuracy |
+| E9 | **Phonetic blocking (Index 6)** — Soundex of leading name token | ✅ Implemented | part of E10 | Recovers transliteration variants |
+| E10 | **Recall fixes** — single-numeric index, address-token index, round-robin candidate cap | ✅ Implemented | **0.9818** | Candidate recall 0.879 → 0.986; best single-model config |
 
 > ✅ = Done and kept | ❌ = Tried and reverted | ⬜ = Not started | 🔄 = In progress
 
@@ -289,14 +296,21 @@ Because F0.5 punishes false merges hard:
 ## 📁 PROJECT STRUCTURE
 
 ```
-amazon-ML/
-├── PROJECT.md              ← YOU ARE HERE — update every session
-├── CONTEXT.md              ← AI assistant reference
-├── problemstatment.md      ← Original problem statement (keep for reference)
+BuisnessEntityResolutionML/
+├── README.md               ← Start here (setup + CLI)
 ├── requirements.txt
+├── Documentation_template.md
 ├── .gitignore
 │
-├── dataset/                ← Drop data here
+├── docs/
+│   ├── PROJECT.md          ← YOU ARE HERE — update every session
+│   ├── CONTEXT.md          ← AI assistant reference
+│   ├── ROADMAP.md
+│   ├── PROJECT_EXPLAINER.md
+│   ├── problem_statement.md
+│   └── organizer_readme.md
+│
+├── dataset/                ← Challenge TSV data (gitignored)
 │   ├── train/
 │   │   ├── train_source1.tsv
 │   │   ├── train_source2.tsv
@@ -308,31 +322,29 @@ amazon-ML/
 │       └── test_source3.tsv
 │
 ├── src/
-│   ├── config.py           ← Paths, seeds, constants, threshold
-│   ├── io.py               ← TSV loaders (always sep="\t")
+│   ├── config.py           ← Paths, seeds, constants, thresholds, feature flags
+│   ├── io.py               ← Streaming TSV loaders (always sep="\t")
 │   ├── normalize.py        ← Name + address normalization
-│   ├── blocking.py         ← 7 blocking strategies + union
+│   ├── blocking.py         ← Multi-pass blocking strategies + union
 │   ├── features.py         ← Pairwise similarity features (name + address + cross)
-│   ├── train.py            ← LightGBM pair classifier + Optuna tuning
+│   ├── train.py            ← LightGBM pair classifier, hard negatives, Optuna
 │   ├── predict.py          ← Inference + threshold + per-S1 matching
-│   ├── evaluate.py         ← Macro F0.5, candidate recall, singleton accuracy
+│   ├── evaluate.py         ← Macro F0.5, threshold/barrier optimizer
 │   └── pipeline.py         ← End-to-end runner
 │
-├── output/
+├── scripts/
+│   ├── test_model_improvements.py  ← Synthetic checks (no dataset needed)
+│   └── diagnose_blocking.py        ← Blocking recall diagnostics
+│
+├── utils/
+│   └── validate_submission.py  ← Official validator — run before submitting
+│
+├── output/                 ← Generated submission files (gitignored)
 │   ├── matching_results.tsv    ← Final submission file
 │   └── candidate_pairs.tsv     ← Required alongside matching_results
 │
-├── utils/
-│   └── validate_submission.py  ← Provided by challenge — run before submitting
-│
-├── notebooks/
-│   ├── 01_eda.ipynb
-│   ├── 02_blocking_analysis.ipynb
-│   └── 03_feature_analysis.ipynb
-│
-├── models/                 ← Saved LightGBM .txt artifacts
-├── reports/                ← Plots, threshold curves, SHAP outputs
-└── submissions/            ← ZIP archives for submission
+├── models/                 ← Saved LightGBM .txt artifacts (gitignored)
+└── reports/                ← Generated logs / plots (gitignored)
 ```
 
 ---
@@ -434,6 +446,11 @@ python3 utils/validate_submission.py \
 | 2026-09-25 | Keep multiple name/address representations | Over-normalization loses distinctiveness |
 | 2026-09-25 | Aligned sampling for dev & smoke runs | Sampling S1/S2/S3 independently broke ground truth linkage; aligned loader guarantees positive pairs |
 | 2026-09-25 | Windows cp1252 / UTF-8 hygiene | Replace unicode emojis with clean text tags (`[SMOKE]`, `[TRAIN]`) for console stability |
+| 2026-09-25 | Hard negatives upweighted, not oversampled | Sample weights avoid inflating row count/memory while sharpening the precision boundary |
+| 2026-09-25 | Conservative rules applied as an empirical gate | Adopted only when they improve held-out F0.5; avoids hurtful hard rejects on missing-address true matches |
+| 2026-09-25 | Singleton barrier tuned, with 0.0 always in the sweep | Guarantees the guard can never lower validation F0.5 |
+| 2026-09-25 | Deterministic, quality-ordered candidate cap | `set(list(...))` truncation depended on hash order; now blocks are queried high-precision-first and S2/S3 interleaved |
+| 2026-09-25 | New model paths are opt-in flags | Preserves the validated E3 baseline while allowing controlled A/B comparison |
 
 ---
 
@@ -456,6 +473,34 @@ python3 utils/validate_submission.py \
                      Independent slicing of S1, S2, S3 gave 0 positive ground truth pairs.
                      Aligned sampler now parses S1 IDs, looks up referenced S2/S3 IDs,
                      and gathers true positives alongside hard negative background noise.
+
+[2026-09-25 18:30] — Advanced the model with experiments E4-E8 and closed the planned-vs-code gap:
+                     E4 hard-negative mining (sample-weight upweight x3), E5 per-source
+                     thresholds (coordinate ascent), E6 dual S1<->S2 / S1<->S3 models,
+                     E7 conservative high-name/no-address rule (kept only if it helps),
+                     E8 singleton confidence barrier (tuned, monotonic improvement).
+                     Also implemented the documented-but-missing blocking Index 6
+                     (Soundex phonetic) and made the candidate cap deterministic and
+                     quality-ordered (was set-order dependent, violating reproducibility).
+                     All new paths are opt-in via config/CLI; defaults keep E3 behaviour
+                     unchanged except hard negatives (on) and rules (auto-evaluated).
+                     Added scripts/test_model_improvements.py (34 synthetic checks, pass).
+
+[2026-09-25 20:10] — Ran the model for real (not just unit tests). Free RAM was only ~1.4GB,
+                     so the full-file `load_aligned_sample` would OOM; rewrote it to stream
+                     the three sources in chunks, keeping only referenced rows + a bounded
+                     background sample. Peak RSS ~175MB. First real run (n_s1=3000):
+                       candidate recall 0.879 (BELOW the 0.92 gate!) -> macro F0.5 0.9465
+                     Diagnosed the 1,238 missed true pairs (scripts/diagnose_blocking.py):
+                       938 share exactly ONE numeric token (Index 5 needed >=2)
+                       229 share no key (noisy name is blank -> only address can connect)
+                       ~130 were reached by a valid block but dropped by the candidate cap
+                     Fixes: single-numeric index (>=3 digits), rare address-token index, and
+                     round-robin interleaving across blocks so no block starves.
+                     Result: candidate recall 0.985 (PASS), macro F0.5 0.9818, pair recall
+                     0.963, pair precision 0.990, singleton accuracy 1.0. Dual models +
+                     per-source thresholds: 0.9820 (statistically tied). Conservative rules
+                     were auto-declined again. Numbers are sample-scale, not full-data.
 ```
 
 ---

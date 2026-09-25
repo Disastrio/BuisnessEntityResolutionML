@@ -1,24 +1,25 @@
-# Byte-compiled / optimized / DLL files
+# ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *$py.class
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
 
-# Data & Large Archives
+# ── Virtual environments ──────────────────────────────────────────────────────
+venv/
+env/
+.env
+
+# ── Data & generated artifacts ────────────────────────────────────────────────
 dataset/
 data/
 output/
 submissions/
 models/
+reports/
 *.zip
-__MACOSX/
-student_resource/
 
-# Virtual Environments & Notebooks
-.ipynb_checkpoints/
-.env
-venv/
-env/
-
-# OS artifacts
+# ── OS artifacts ──────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db

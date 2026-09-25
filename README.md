@@ -80,16 +80,20 @@ The objective is to map every clean reference record in **Source 1 (`S1`)** to a
 
 ```
 BuisnessEntityResolutionML/
-├── PROJECT_EXPLAINER.md        # Comprehensive plain-English human explainer
-├── PROJECT.md                  # Project tracker, experiment ledger, current status
-├── ROADMAP.md                  # Milestone execution plan & architectural routes
-├── CONTEXT.md                  # System prompt & operational rules
 ├── README.md                   # Repository overview, setup, and CLI guide
-├── problemstatment.md          # Official contest problem statement from organizers
-├── Documentation_template.md   # Final methodology documentation writeup template
 ├── requirements.txt            # Pinned Python package dependencies
+├── Documentation_template.md   # Official methodology template (filled for submission)
+├── .gitignore
 │
-├── dataset/                    # Challenge TSV datasets (sep="\t")
+├── docs/                       # All long-form documentation
+│   ├── PROJECT.md              # Project tracker, experiment ledger, current status
+│   ├── ROADMAP.md              # Milestone execution plan & architectural routes
+│   ├── CONTEXT.md              # Rules of engagement, data dictionary, feature log
+│   ├── PROJECT_EXPLAINER.md    # Plain-English guide to every design choice
+│   ├── problem_statement.md    # Official problem statement (expanded guide)
+│   └── organizer_readme.md     # Official organizer README
+│
+├── dataset/                    # Challenge TSV datasets (sep="\t", gitignored)
 │   ├── train/
 │   │   ├── train_source1.tsv       # S1 reference entities (2.2M rows)
 │   │   ├── train_source2.tsv       # S2 noisy entities (5.0M rows)
@@ -101,25 +105,29 @@ BuisnessEntityResolutionML/
 │       └── test_source3.tsv        # S3 test records (5.1M rows) [includes France]
 │
 ├── src/                        # Production ER Pipeline
-│   ├── __init__.py             # Module docstrings & package init
-│   ├── config.py               # Paths, seeds, constants, thresholds
-│   ├── io.py                   # High-speed TSV loaders & aligned dev sampling
+│   ├── __init__.py             # Package init & module map
+│   ├── config.py               # Paths, seeds, constants, thresholds, feature flags
+│   ├── io.py                   # Streaming TSV loaders & aligned dev sampling
 │   ├── normalize.py            # Multilingual Unicode NFKD & regex cleaners
-│   ├── blocking.py             # 7-tier candidate blocking engine
+│   ├── blocking.py             # Multi-pass candidate blocking engine
 │   ├── features.py             # 28 pairwise similarity feature generator
-│   ├── train.py                # LightGBM classifier & Optuna tuner
-│   ├── evaluate.py             # Macro-F0.5 calculator & threshold optimizer
+│   ├── train.py                # LightGBM classifier, hard negatives, Optuna tuner
+│   ├── evaluate.py             # Macro-F0.5, threshold/barrier optimizer
 │   ├── predict.py              # Test inference & TSV output formatter
 │   └── pipeline.py             # Unified CLI runner (smoke, train, predict)
 │
-├── output/                     # Generated submission artifacts
-│   ├── matching_results.tsv    # Target predictions (Leaderboard scored)
-│   └── candidate_pairs.tsv     # Candidate pairs (Blocking audit)
+├── scripts/
+│   ├── test_model_improvements.py  # 34 synthetic checks (no dataset needed)
+│   └── diagnose_blocking.py        # Why true matches are missed by the blocker
 │
 ├── utils/
 │   └── validate_submission.py  # Official verification script (must PASS)
-├── models/                     # Serialized LightGBM models
-└── reports/                    # Validation curves & feature importance
+│
+├── output/                     # Generated submission artifacts (gitignored)
+│   ├── matching_results.tsv    # Target predictions (leaderboard scored)
+│   └── candidate_pairs.tsv     # Candidate pairs (blocking audit)
+├── models/                     # Serialized LightGBM models (gitignored)
+└── reports/                    # Generated logs, curves, EDA output (gitignored)
 ```
 
 ---
@@ -173,6 +181,69 @@ Generates candidates, evaluates features, applies the tuned threshold $t^* \appr
 ```bash
 python -m src.pipeline --mode predict
 ```
+
+### Mode D: Advanced Model Options (Experiments E4–E8)
+The model improvements are opt-in so the validated E3 baseline stays reproducible.
+
+| Flag | Experiment | Effect |
+|---|---|---|
+| `--no-hard-negatives` | E4 | Disable x3 upweighting of same-name / same-address negatives |
+| `--source-thresholds` | E5 | Tune separate decision thresholds for S2 and S3 |
+| `--dual-model` | E6 | Train separate `S1↔S2` and `S1↔S3` LightGBM models |
+| `--no-rules` | E7 | Disable the conservative high-name/no-address rejection rule |
+| `--barrier <p>` | E8 | Singleton confidence-barrier floor (tuned upward on validation) |
+
+```bash
+# Full model: hard negatives + per-source thresholds + rules + dual models
+python -m src.pipeline --mode train --sample 100000 --dual-model --source-thresholds
+```
+
+```bash
+# Force a conservative singleton barrier of 0.80
+python -m src.pipeline --mode train --barrier 0.80
+```
+
+> **Note:** the conservative rule is only kept when it improves held-out F0.5, and the
+> singleton barrier sweep always includes `0.0`, so neither guard can reduce the
+> validation score.
+
+---
+
+## 🧪 Model Verification (No Dataset Needed)
+
+All model upgrades are covered by a fast, self-contained harness that runs on tiny
+synthetic data (safe under low memory):
+
+```bash
+python scripts/test_model_improvements.py
+```
+
+It checks the phonetic blocking index, hard-negative weighting, per-source threshold
+tuning, the singleton barrier, conservative rules, dual-model save/load, the
+round-robin candidate cap, and the official submission validator end-to-end
+(34 checks).
+
+To understand *why* the blocker misses true matches on a real sample, run:
+
+```bash
+python scripts/diagnose_blocking.py 3000
+```
+
+### Streaming, low-memory training
+
+`src/io.py::load_aligned_sample` reads the three sources in chunks and never
+materialises the full multi-GB files, so training samples run in a few hundred MB
+(measured ~175 MB RSS) rather than requiring tens of GB.
+
+### Measured results (streaming 3,000-S1 aligned sample, 600 held-out S1 entities)
+
+| Configuration | Candidate recall | Pair precision | Pair recall | **Macro F0.5** |
+|---|---|---|---|---|
+| Before blocking-recall fixes | 0.879 | 0.991 | 0.873 | 0.9465 |
+| Single model + hard negatives (default) | 0.985 | 0.990 | 0.963 | **0.9818** |
+| Dual models + per-source thresholds | 0.986 | 0.989 | 0.959 | **0.9820** |
+
+These are sample-scale numbers, not the full 2.2M-entity test score.
 
 ---
 
@@ -229,8 +300,9 @@ To prepare the final submission archive:
 
 ## 📖 Additional Documentation
 
-- [Project Human Explainer (`PROJECT_EXPLAINER.md`)](file:///r:/BuisnessEntityResolutionML/PROJECT_EXPLAINER.md) — Intuitive, detailed plain-English guide covering every architectural design choice.
-- [Project Tracker (`PROJECT.md`)](file:///r:/BuisnessEntityResolutionML/PROJECT.md) — Live experiment ledger, parameter log, and decision tracker.
-- [Roadmap & Route Analysis (`ROADMAP.md`)](file:///r:/BuisnessEntityResolutionML/ROADMAP.md) — Deep dive into 4 architectural routes and milestone criteria.
-- [AI & Team Context (`CONTEXT.md`)](file:///r:/BuisnessEntityResolutionML/CONTEXT.md) — Engineering rules of engagement, data dictionary, and feature log.
-- [Problem Statement (`problemstatment.md`)](file:///r:/BuisnessEntityResolutionML/problemstatment.md) — Original challenge prompt from the organizers.
+- [Project Human Explainer](docs/PROJECT_EXPLAINER.md) — Intuitive, detailed plain-English guide covering every architectural design choice.
+- [Project Tracker](docs/PROJECT.md) — Live experiment ledger, parameter log, and decision tracker.
+- [Roadmap & Route Analysis](docs/ROADMAP.md) — Architectural routes and milestone criteria.
+- [AI & Team Context](docs/CONTEXT.md) — Engineering rules of engagement, data dictionary, and feature log.
+- [Problem Statement](docs/problem_statement.md) — The official challenge prompt.
+- [Organizer README](docs/organizer_readme.md) — The resource pack README from the organizers.

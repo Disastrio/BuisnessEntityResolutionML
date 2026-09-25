@@ -11,10 +11,15 @@ Blocking Strategies:
     Index 3: Postal/PIN code (country + postal_code)
     Index 4: Rare name tokens (TF-IDF > threshold, inverted index)
     Index 5: Shared numerics + country (addr numbers + country)
-    Index 6: Character n-grams of name (3-char shingles)
+    Index 6: Soundex / phonetic prefix of the leading name token
     Index 7: Relaxed — first 4 chars of name + country (catch-all)
+
+Candidates are accumulated in index-reliability order and truncated at
+MAX_CANDIDATES, so the retained set is deterministic (stable across runs and
+PYTHONHASHSEED values) and keeps the highest-precision blocks first.
 """
 from collections import defaultdict
+from itertools import zip_longest
 from typing import Dict, Set, List, Tuple, Optional
 import re
 import math
@@ -23,7 +28,9 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-from src.config import MAX_CANDIDATES, ID_COL
+from src.config import (
+    MAX_CANDIDATES, ID_COL, USE_PHONETIC_BLOCK, SOUNDEX_LENGTH, BLOCK_FETCH_CAP,
+)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -66,6 +73,60 @@ def _build_inverted_index_fast(
         if key and str(key).strip():
             index[str(key).strip()].append(eid)
     return dict(index)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Phonetic (Soundex) Helpers — Index 6
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Standard American Soundex letter → digit grouping.
+_SOUNDEX_GROUPS = [
+    ('bfpv', '1'),
+    ('cgjkqsxz', '2'),
+    ('dt', '3'),
+    ('l', '4'),
+    ('mn', '5'),
+    ('r', '6'),
+]
+_SOUNDEX_MAP: Dict[str, str] = {
+    ch: digit for letters, digit in _SOUNDEX_GROUPS for ch in letters
+}
+
+
+def soundex(token: str, length: int = SOUNDEX_LENGTH) -> str:
+    """
+    Compute the Soundex code of a token (ASCII letters only).
+
+    Collapses adjacent identical codes and drops vowels / h / w (which reset the
+    previous code), which makes it robust to transliteration and small typos
+    (e.g. 'kalyan' and 'calian' both encode to 'K450').
+
+    Returns an uppercase code of exactly `length` characters, or '' for tokens
+    with no alphabetic characters.
+    """
+    if not token:
+        return ""
+    letters = re.sub(r'[^a-z]', '', str(token).lower())
+    if not letters:
+        return ""
+
+    first = letters[0]
+    out = first
+    prev = _SOUNDEX_MAP.get(first, '')
+    for ch in letters[1:]:
+        code = _SOUNDEX_MAP.get(ch, '')
+        if code and code != prev:
+            out += code
+        if ch not in 'hw':   # h/w are transparent; vowels reset the chain (code='')
+            prev = code
+    return (out.upper() + '0' * length)[:length]
+
+
+def _first_name_token(name: str) -> str:
+    """Return the leading name token after dropping a leading 'the'."""
+    cleaned = re.sub(r'^the\s+', '', str(name).strip())
+    tokens = cleaned.split()
+    return tokens[0] if tokens else ''
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -170,16 +231,20 @@ def compute_rare_tokens(
     df: pd.DataFrame,
     min_freq: int = 2,
     max_doc_frac: float = 0.01,
+    col: str = 'name_tokens',
 ) -> Set[str]:
     """
     Find tokens that appear in at least min_freq documents but in at most
     max_doc_frac fraction of all documents. These are distinctive tokens
     useful for blocking.
+
+    `col` selects the token column ('name_tokens' or 'addr_clean'); address
+    blocking reuses this to find distinctive street/area tokens.
     """
     doc_freq = defaultdict(int)
     n_docs = len(df)
 
-    for tokens_str in df['name_tokens']:
+    for tokens_str in df[col]:
         if not tokens_str or str(tokens_str).strip() == '':
             continue
         unique_tokens = set(str(tokens_str).split())
@@ -201,13 +266,16 @@ def compute_rare_tokens(
 def build_candidate_indices(
     target_df: pd.DataFrame,
     rare_tokens: Optional[Set[str]] = None,
+    rare_addr_tokens: Optional[Set[str]] = None,
 ) -> Dict[str, Dict[str, List[str]]]:
     """
-    Build all 7 inverted indices for a target source (S2 or S3).
+    Build all inverted indices for a target source (S2 or S3).
 
     Args:
         target_df: Normalized S2 or S3 DataFrame.
-        rare_tokens: Set of rare tokens for Index 4.
+        rare_tokens: Distinctive name tokens (Index 4).
+        rare_addr_tokens: Distinctive address tokens (Index 8) — lets pairs
+            connect on address alone, which matters when the noisy name is blank.
 
     Returns:
         Dict with index names as keys and inverted indices as values.
@@ -283,6 +351,54 @@ def build_candidate_indices(
                 idx5[f"{country}|nums|{key}"].append(eid)
     indices['addr_numerics'] = dict(idx5)
 
+    # Index 6: Phonetic (Soundex) prefix of leading name token
+    if USE_PHONETIC_BLOCK:
+        print("  Building Index 6 (phonetic / soundex)...")
+        idx6 = defaultdict(list)
+        for eid, name, country in zip(
+            target_df[ID_COL], target_df['name_clean'], target_df['country_clean']
+        ):
+            country = str(country).strip()
+            token = _first_name_token(name)
+            if token:
+                code = soundex(token, SOUNDEX_LENGTH)
+                if code:
+                    idx6[f"{country}|sndx|{code}"].append(eid)
+        indices['soundex'] = dict(idx6)
+
+    # Index 5b: Single numeric address token (>= 3 digits) + country.
+    # Catches pairs that share exactly one meaningful number (plot/house/PIN
+    # fragment); Index 5 requires >= 2 shared numbers and misses these.
+    print("  Building Index 5b (single numeric tokens)...")
+    idx5b = defaultdict(list)
+    for eid, nums, country in zip(
+        target_df[ID_COL], target_df['addr_numeric'], target_df['country_clean']
+    ):
+        nums = str(nums).strip()
+        country = str(country).strip()
+        if nums:
+            for tok in set(nums.split()):
+                if len(tok) >= 3:
+                    idx5b[f"{country}|num|{tok}"].append(eid)
+    indices['num_single'] = dict(idx5b)
+
+    # Index 8: Rare address tokens (street/area names) + country.
+    # Primary connect signal for records whose business name is blank.
+    if rare_addr_tokens:
+        print(f"  Building Index 8 (rare address tokens, "
+              f"{len(rare_addr_tokens)} tokens)...")
+        idx8 = defaultdict(list)
+        for eid, addr, country in zip(
+            target_df[ID_COL], target_df['addr_clean'], target_df['country_clean']
+        ):
+            addr = str(addr).strip()
+            country = str(country).strip()
+            if addr:
+                for tok in set(addr.split()):
+                    if tok in rare_addr_tokens and len(tok) >= 3:
+                        idx8[f"{country}|atok|{tok}"].append(eid)
+        indices['addr_rare'] = dict(idx8)
+
     # Index 7: Relaxed name
     print("  Building Index 7 (relaxed name)...")
     idx7 = defaultdict(list)
@@ -298,73 +414,131 @@ def build_candidate_indices(
     return indices
 
 
-def generate_candidates_for_s1(
+def _ranked_candidates_for_s1(
     s1_row: pd.Series,
     indices: Dict[str, Dict[str, List[str]]],
     rare_tokens: Optional[Set[str]] = None,
+    rare_addr_tokens: Optional[Set[str]] = None,
     max_candidates: int = MAX_CANDIDATES,
-) -> Set[str]:
+) -> List[str]:
     """
     Generate candidate IDs for a single S1 entity by querying all indices.
 
-    Returns union of all candidates, capped at max_candidates.
+    Each block contributes its own list; the final set is built by round-robin
+    interleaving across blocks, so a huge high-precision block cannot starve
+    later blocks (relaxed name, phonetics, single numerics, address tokens) out
+    of the candidate cap — the failure mode that previously dropped true
+    matches. Deterministic and bounded: blocks are fetched in high-precision
+    order and each block is capped at BLOCK_FETCH_CAP before interleaving.
     """
-    candidates = set()
-
     name = str(s1_row.get('name_clean', '')).strip()
     country = str(s1_row.get('country_clean', '')).strip()
     postal = str(s1_row.get('addr_postal', '')).strip()
     nums = str(s1_row.get('addr_numeric', '')).strip()
     tokens_str = str(s1_row.get('name_tokens', '')).strip()
-
-    # Index 1: Exact name
-    key1 = f"{country}|{name}"
-    if key1 in indices.get('exact_name', {}):
-        candidates.update(indices['exact_name'][key1])
-
-    # Index 2: Name prefix
+    addr = str(s1_row.get('addr_clean', '')).strip()
     clean_name = re.sub(r'^the\s+', '', name)
-    if len(clean_name) >= 3:
-        key2 = f"{country}|pfx|{clean_name[:6]}"
-        if key2 in indices.get('name_prefix', {}):
-            candidates.update(indices['name_prefix'][key2])
 
-    # Index 3: Postal code
+    def fetch(index_name: str, key: str) -> List[str]:
+        if not key:
+            return []
+        return indices.get(index_name, {}).get(key, [])
+
+    block_lists: List[List[str]] = []
+
+    # 1: Exact name
+    block_lists.append(fetch('exact_name', f"{country}|{name}"))
+
+    # 3: Postal code
+    post_ids: List[str] = []
     if postal:
         for code in postal.split(','):
             code = code.strip()
-            if code:
-                key3 = f"{country}|post|{code}"
-                if key3 in indices.get('postal', {}):
-                    candidates.update(indices['postal'][key3])
+            post_ids.extend(fetch('postal', f"{country}|post|{code}"))
+    block_lists.append(post_ids)
 
-    # Index 4: Rare name tokens
+    # 2: Name prefix
+    if len(clean_name) >= 3:
+        block_lists.append(fetch('name_prefix', f"{country}|pfx|{clean_name[:6]}"))
+    else:
+        block_lists.append([])
+
+    # 4: Rare name tokens
+    rare_ids: List[str] = []
     if rare_tokens and tokens_str:
         for tok in tokens_str.split():
             if tok in rare_tokens and len(tok) >= 3:
-                key4 = f"{country}|rtok|{tok}"
-                if key4 in indices.get('rare_tokens', {}):
-                    candidates.update(indices['rare_tokens'][key4])
+                rare_ids.extend(fetch('rare_tokens', f"{country}|rtok|{tok}"))
+    block_lists.append(rare_ids)
 
-    # Index 5: Address numerics
+    # 6: Phonetic (Soundex) prefix of leading token
+    sndx_ids: List[str] = []
+    if USE_PHONETIC_BLOCK:
+        token = _first_name_token(name)
+        if token:
+            sndx_ids = fetch('soundex', f"{country}|sndx|{soundex(token, SOUNDEX_LENGTH)}")
+    block_lists.append(sndx_ids)
+
+    # 5: Combined address numerics (>= 2 shared)
+    comb_ids: List[str] = []
     if nums:
         num_list = sorted(set(nums.split()))
         if len(num_list) >= 2:
-            key5 = f"{country}|nums|{'_'.join(num_list[:3])}"
-            if key5 in indices.get('addr_numerics', {}):
-                candidates.update(indices['addr_numerics'][key5])
+            comb_ids = fetch('addr_numerics',
+                             f"{country}|nums|{'_'.join(num_list[:3])}")
+    block_lists.append(comb_ids)
 
-    # Index 7: Relaxed name
+    # 5b: Single meaningful numeric tokens (>= 3 digits)
+    single_ids: List[str] = []
+    if nums:
+        for tok in set(nums.split()):
+            if len(tok) >= 3:
+                single_ids.extend(fetch('num_single', f"{country}|num|{tok}"))
+    block_lists.append(single_ids)
+
+    # 8: Rare address tokens (connect blank-name records by address)
+    addr_ids: List[str] = []
+    if rare_addr_tokens and addr:
+        for tok in set(addr.split()):
+            if tok in rare_addr_tokens and len(tok) >= 3:
+                addr_ids.extend(fetch('addr_rare', f"{country}|atok|{tok}"))
+    block_lists.append(addr_ids)
+
+    # 7: Relaxed name (lowest precision catch-all)
     if len(clean_name) >= 3:
-        key7 = f"{country}|rel|{clean_name[:4]}"
-        if key7 in indices.get('relaxed_name', {}):
-            candidates.update(indices['relaxed_name'][key7])
+        block_lists.append(fetch('relaxed_name', f"{country}|rel|{clean_name[:4]}"))
+    else:
+        block_lists.append([])
 
-    # Cap at max_candidates
-    if len(candidates) > max_candidates:
-        candidates = set(list(candidates)[:max_candidates])
+    # Bound per-block work, then round-robin interleave (dedup across blocks).
+    block_lists = [b[:BLOCK_FETCH_CAP] for b in block_lists]
+    ordered: List[str] = []
+    seen: Set[str] = set()
+    max_len = max((len(b) for b in block_lists), default=0)
+    for i in range(max_len):
+        for block in block_lists:
+            if i < len(block):
+                eid = block[i]
+                if eid not in seen:
+                    seen.add(eid)
+                    ordered.append(eid)
+                    if len(ordered) >= max_candidates:
+                        return ordered
+    return ordered
 
-    return candidates
+
+def generate_candidates_for_s1(
+    s1_row: pd.Series,
+    indices: Dict[str, Dict[str, List[str]]],
+    rare_tokens: Optional[Set[str]] = None,
+    rare_addr_tokens: Optional[Set[str]] = None,
+    max_candidates: int = MAX_CANDIDATES,
+) -> Set[str]:
+    """Set-returning wrapper around `_ranked_candidates_for_s1`."""
+    return set(_ranked_candidates_for_s1(
+        s1_row, indices, rare_tokens=rare_tokens,
+        rare_addr_tokens=rare_addr_tokens, max_candidates=max_candidates,
+    ))
 
 
 def generate_all_candidates(
@@ -386,22 +560,23 @@ def generate_all_candidates(
     Returns:
         Dict: {s1_id: set(candidate_s2_s3_ids)}
     """
-    print("Computing rare tokens for S2...")
-    rare_tokens_s2 = compute_rare_tokens(s2_df)
-    print(f"  Found {len(rare_tokens_s2)} rare tokens in S2")
+    print("Computing distinctive tokens for S2...")
+    rare_tokens_s2 = compute_rare_tokens(s2_df, col='name_tokens')
+    rare_addr_s2 = compute_rare_tokens(s2_df, col='addr_clean')
+    print(f"  S2: {len(rare_tokens_s2)} name tokens, {len(rare_addr_s2)} address tokens")
 
-    print("Computing rare tokens for S3...")
-    rare_tokens_s3 = compute_rare_tokens(s3_df)
-    print(f"  Found {len(rare_tokens_s3)} rare tokens in S3")
-
-    # Combine rare tokens
-    all_rare = rare_tokens_s2 | rare_tokens_s3
+    print("Computing distinctive tokens for S3...")
+    rare_tokens_s3 = compute_rare_tokens(s3_df, col='name_tokens')
+    rare_addr_s3 = compute_rare_tokens(s3_df, col='addr_clean')
+    print(f"  S3: {len(rare_tokens_s3)} name tokens, {len(rare_addr_s3)} address tokens")
 
     print("\nBuilding S2 indices...")
-    s2_indices = build_candidate_indices(s2_df, rare_tokens=rare_tokens_s2)
+    s2_indices = build_candidate_indices(
+        s2_df, rare_tokens=rare_tokens_s2, rare_addr_tokens=rare_addr_s2)
 
     print("\nBuilding S3 indices...")
-    s3_indices = build_candidate_indices(s3_df, rare_tokens=rare_tokens_s3)
+    s3_indices = build_candidate_indices(
+        s3_df, rare_tokens=rare_tokens_s3, rare_addr_tokens=rare_addr_s3)
 
     # Generate candidates for each S1 entity
     print(f"\nGenerating candidates for {len(s1_df)} S1 entities...")
@@ -414,26 +589,36 @@ def generate_all_candidates(
     for _, s1_row in iterator:
         s1_id = s1_row[ID_COL]
 
-        # Query S2 indices
-        s2_cands = generate_candidates_for_s1(
+        # Ranked candidate lists per source (highest-precision blocks first)
+        s2_ranked = _ranked_candidates_for_s1(
             s1_row, s2_indices,
             rare_tokens=rare_tokens_s2,
+            rare_addr_tokens=rare_addr_s2,
             max_candidates=max_candidates,
         )
-
-        # Query S3 indices
-        s3_cands = generate_candidates_for_s1(
+        s3_ranked = _ranked_candidates_for_s1(
             s1_row, s3_indices,
             rare_tokens=rare_tokens_s3,
+            rare_addr_tokens=rare_addr_s3,
             max_candidates=max_candidates,
         )
 
-        combined = s2_cands | s3_cands
-        # Final cap
-        if len(combined) > max_candidates:
-            combined = set(list(combined)[:max_candidates])
+        # Interleave S2/S3 by block rank so neither source is starved when the
+        # global cap is reached (deterministic, no set-order dependence).
+        combined: List[str] = []
+        seen: Set[str] = set()
+        for s2_id, s3_id in zip_longest(s2_ranked, s3_ranked):
+            for eid in (s2_id, s3_id):
+                if eid is None or eid in seen:
+                    continue
+                seen.add(eid)
+                combined.append(eid)
+                if len(combined) >= max_candidates:
+                    break
+            if len(combined) >= max_candidates:
+                break
 
-        all_candidates[s1_id] = combined
+        all_candidates[s1_id] = set(combined)
 
     return all_candidates
 

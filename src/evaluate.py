@@ -13,6 +13,32 @@ import numpy as np
 from src.config import BETA
 
 
+def infer_source(entity_id: str) -> str:
+    """
+    Map a target entity ID to its source label.
+
+    Source is encoded in the ID prefix (``S2-`` / ``S3-``); never inferred from
+    a hard-coded list of sources, so it works for any future source.
+    """
+    s = str(entity_id)
+    if s.startswith("S2"):
+        return "S2"
+    if s.startswith("S3"):
+        return "S3"
+    return "UNK"
+
+
+def _resolve_threshold(target_id: str, threshold: Optional[float],
+                       thresholds_by_source: Optional[Dict[str, float]]) -> float:
+    """Pick the decision threshold for one target ID (per-source overrides scalar)."""
+    if thresholds_by_source:
+        return thresholds_by_source.get(
+            infer_source(target_id),
+            threshold if threshold is not None else 0.5,
+        )
+    return threshold if threshold is not None else 0.5
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Per-Entity F-beta Score
 # ═════════════════════════════════════════════════════════════════════════════
@@ -155,8 +181,58 @@ def detailed_evaluation(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Threshold Sweep
+# Prediction Assembly (threshold / per-source thresholds / barrier / rules)
 # ═════════════════════════════════════════════════════════════════════════════
+
+def assemble_predictions(
+    s1_ids: List[str],
+    target_ids: List[str],
+    probabilities: np.ndarray,
+    threshold: Optional[float] = None,
+    thresholds_by_source: Optional[Dict[str, float]] = None,
+    all_s1_ids: Optional[Set[str]] = None,
+    barrier: float = 0.0,
+    reject_mask: Optional[np.ndarray] = None,
+) -> Dict[str, Set[str]]:
+    """
+    Core per-S1 prediction assembler shared by tuning and inference.
+
+    Args:
+        threshold: scalar global decision threshold.
+        thresholds_by_source: {'S2': t2, 'S3': t3}; overrides `threshold`.
+        all_s1_ids: complete S1 set, so singletons receive empty sets.
+        barrier: singleton guard — an entity keeps its matches only if its single
+            best accepted probability is >= barrier (0.0 disables the guard).
+        reject_mask: boolean array; True rejects the pair outright (decision rules).
+
+    Returns:
+        {s1_id: set(matched_ids)}
+    """
+    predictions: Dict[str, Set[str]] = {}
+    if all_s1_ids:
+        for s1_id in all_s1_ids:
+            predictions[s1_id] = set()
+
+    best_prob: Dict[str, float] = {}
+    probs_arr = np.asarray(probabilities)
+
+    for i, (s1_id, t_id) in enumerate(zip(s1_ids, target_ids)):
+        if reject_mask is not None and bool(reject_mask[i]):
+            continue
+        prob = float(probs_arr[i])
+        if prob < _resolve_threshold(t_id, threshold, thresholds_by_source):
+            continue
+        predictions.setdefault(s1_id, set()).add(t_id)
+        if prob > best_prob.get(s1_id, -1.0):
+            best_prob[s1_id] = prob
+
+    if barrier and barrier > 0.0:
+        for s1_id, matched in predictions.items():
+            if matched and best_prob.get(s1_id, 0.0) < barrier:
+                predictions[s1_id] = set()
+
+    return predictions
+
 
 def threshold_sweep(
     s1_ids: List[str],
@@ -165,51 +241,161 @@ def threshold_sweep(
     ground_truth: Dict[str, Set[str]],
     thresholds: Optional[List[float]] = None,
     beta: float = BETA,
+    reject_mask: Optional[np.ndarray] = None,
+    barrier: float = 0.0,
 ) -> Tuple[float, float, List[dict]]:
     """
-    Sweep decision thresholds to find optimal macro F0.5.
+    Sweep a scalar decision threshold to find optimal macro F0.5.
 
     Args:
-        s1_ids: List of S1 entity IDs for each pair.
-        target_ids: List of target (S2/S3) entity IDs for each pair.
-        probabilities: Model output probabilities for each pair.
-        ground_truth: {s1_id: set(true_matched_ids)}
         thresholds: List of thresholds to try. Default: 0.30 to 0.95 step 0.01.
-        beta: Beta parameter.
+        reject_mask: pairs rejected by conservative decision rules.
+        barrier: singleton confidence barrier applied at every threshold.
 
     Returns:
         (best_threshold, best_score, sweep_results)
     """
     if thresholds is None:
         thresholds = [round(t, 2) for t in np.arange(0.30, 0.96, 0.01)]
+    thresholds = [float(t) for t in thresholds]
 
     sweep_results = []
     best_threshold = 0.5
-    best_score = 0.0
+    best_score = -1.0
 
     for thresh in thresholds:
-        # Build predictions at this threshold
-        predictions: Dict[str, Set[str]] = {}
-        for s1_id in ground_truth:
-            predictions[s1_id] = set()
-
-        for s1_id, t_id, prob in zip(s1_ids, target_ids, probabilities):
-            if prob >= thresh:
-                if s1_id not in predictions:
-                    predictions[s1_id] = set()
-                predictions[s1_id].add(t_id)
-
+        predictions = assemble_predictions(
+            s1_ids, target_ids, probabilities,
+            threshold=thresh,
+            all_s1_ids=set(ground_truth.keys()),
+            barrier=barrier,
+            reject_mask=reject_mask,
+        )
         score = macro_fbeta(ground_truth, predictions, beta)
-        sweep_results.append({
-            'threshold': thresh,
-            'macro_fbeta': round(score, 6),
-        })
-
+        sweep_results.append({'threshold': thresh, 'macro_fbeta': round(score, 6)})
         if score > best_score:
             best_score = score
             best_threshold = thresh
 
     return best_threshold, best_score, sweep_results
+
+
+def threshold_sweep_by_source(
+    s1_ids: List[str],
+    target_ids: List[str],
+    probabilities: np.ndarray,
+    ground_truth: Dict[str, Set[str]],
+    thresholds: Optional[List[float]] = None,
+    beta: float = BETA,
+    reject_mask: Optional[np.ndarray] = None,
+    barrier: float = 0.0,
+    max_iters: int = 3,
+) -> Tuple[Dict[str, float], float, List[dict]]:
+    """
+    Jointly tune separate S2 / S3 decision thresholds for macro F0.5.
+
+    S2 and S3 have different noise profiles, so one global threshold is often
+    suboptimal. The two thresholds interact inside the per-entity score, so we
+    use deterministic coordinate ascent from the global optimum: alternately
+    optimise one source while holding the other fixed until no further
+    improvement (or `max_iters`).
+
+    Returns:
+        ({'S2': t2, 'S3': t3}, best_score, history)
+    """
+    if thresholds is None:
+        thresholds = [round(t, 2) for t in np.arange(0.30, 0.96, 0.05)]
+    thresholds = [float(t) for t in thresholds]
+
+    global_t, global_score, _ = threshold_sweep(
+        s1_ids, target_ids, probabilities, ground_truth,
+        thresholds=thresholds, beta=beta, reject_mask=reject_mask, barrier=barrier,
+    )
+    global_t = float(global_t)
+
+    best = {'S2': global_t, 'S3': global_t}
+    best_score = global_score
+    history: List[dict] = [
+        {'iteration': 0, 'S2': global_t, 'S3': global_t,
+         'macro_fbeta': round(global_score, 6)}
+    ]
+
+    for it in range(1, max_iters + 1):
+        improved = False
+        for src in ('S2', 'S3'):
+            current = best[src]
+            for t in thresholds:
+                if t == current:
+                    continue
+                candidate = dict(best)
+                candidate[src] = t
+                predictions = assemble_predictions(
+                    s1_ids, target_ids, probabilities,
+                    thresholds_by_source=candidate,
+                    all_s1_ids=set(ground_truth.keys()),
+                    barrier=barrier,
+                    reject_mask=reject_mask,
+                )
+                score = macro_fbeta(ground_truth, predictions, beta)
+                if score > best_score + 1e-12:
+                    best_score = score
+                    best = candidate
+                    improved = True
+        history.append({
+            'iteration': it, 'S2': best['S2'], 'S3': best['S3'],
+            'macro_fbeta': round(best_score, 6),
+        })
+        if not improved:
+            break
+
+    return best, best_score, history
+
+
+def sweep_singleton_barrier(
+    s1_ids: List[str],
+    target_ids: List[str],
+    probabilities: np.ndarray,
+    ground_truth: Dict[str, Set[str]],
+    threshold: Optional[float] = None,
+    thresholds_by_source: Optional[Dict[str, float]] = None,
+    barriers: Optional[List[float]] = None,
+    beta: float = BETA,
+    reject_mask: Optional[np.ndarray] = None,
+) -> Tuple[float, float, List[dict]]:
+    """
+    Tune the singleton confidence barrier at a fixed threshold.
+
+    The barrier is a second-level gate: an entity only emits matches when its
+    best accepted probability clears the barrier. It is a cheap, targeted way to
+    protect the ~5.6% singleton entities without hurting confident matches.
+
+    Returns:
+        (best_barrier, best_score, sweep_results)
+    """
+    if barriers is None:
+        barriers = [0.0] + [round(b, 2) for b in np.arange(0.50, 0.99, 0.02)]
+    barriers = [float(b) for b in barriers]
+
+    sweep_results = []
+    best_barrier = 0.0
+    best_score = -1.0
+
+    for barrier in barriers:
+        predictions = assemble_predictions(
+            s1_ids, target_ids, probabilities,
+            threshold=threshold,
+            thresholds_by_source=thresholds_by_source,
+            all_s1_ids=set(ground_truth.keys()),
+            barrier=barrier,
+            reject_mask=reject_mask,
+        )
+        score = macro_fbeta(ground_truth, predictions, beta)
+        sweep_results.append({'barrier': barrier, 'macro_fbeta': round(score, 6)})
+        if score > best_score:
+            best_score = score
+            best_barrier = barrier
+
+    return best_barrier, best_score, sweep_results
 
 
 def apply_threshold(
@@ -218,34 +404,38 @@ def apply_threshold(
     probabilities: np.ndarray,
     threshold: float,
     all_s1_ids: Optional[Set[str]] = None,
+    thresholds_by_source: Optional[Dict[str, float]] = None,
+    barrier: float = 0.0,
+    reject_mask: Optional[np.ndarray] = None,
 ) -> Dict[str, Set[str]]:
-    """
-    Apply a decision threshold to produce per-S1 predictions.
+    """Backward-compatible threshold application (see `assemble_predictions`)."""
+    return assemble_predictions(
+        s1_ids, target_ids, probabilities,
+        threshold=threshold,
+        thresholds_by_source=thresholds_by_source,
+        all_s1_ids=all_s1_ids,
+        barrier=barrier,
+        reject_mask=reject_mask,
+    )
 
-    Args:
-        s1_ids: List of S1 entity IDs for each pair.
-        target_ids: List of target IDs for each pair.
-        probabilities: Model probabilities.
-        threshold: Decision threshold.
-        all_s1_ids: Complete set of S1 IDs (to ensure singletons get empty sets).
 
-    Returns:
-        {s1_id: set(matched_ids)}
-    """
-    predictions: Dict[str, Set[str]] = {}
-
-    # Initialize all S1 IDs with empty sets
-    if all_s1_ids:
-        for s1_id in all_s1_ids:
-            predictions[s1_id] = set()
-
-    for s1_id, t_id, prob in zip(s1_ids, target_ids, probabilities):
-        if prob >= threshold:
-            if s1_id not in predictions:
-                predictions[s1_id] = set()
-            predictions[s1_id].add(t_id)
-
-    return predictions
+def apply_threshold_by_source(
+    s1_ids: List[str],
+    target_ids: List[str],
+    probabilities: np.ndarray,
+    thresholds_by_source: Dict[str, float],
+    all_s1_ids: Optional[Set[str]] = None,
+    barrier: float = 0.0,
+    reject_mask: Optional[np.ndarray] = None,
+) -> Dict[str, Set[str]]:
+    """Apply per-source decision thresholds (see `assemble_predictions`)."""
+    return assemble_predictions(
+        s1_ids, target_ids, probabilities,
+        thresholds_by_source=thresholds_by_source,
+        all_s1_ids=all_s1_ids,
+        barrier=barrier,
+        reject_mask=reject_mask,
+    )
 
 
 if __name__ == '__main__':

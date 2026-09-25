@@ -24,17 +24,22 @@ This is a **Large-Scale Multi-Source Business Entity Resolution** task:
 
 ## 2. Optimized Project Architecture
 
-The existing repository contained generic tabular ML templates (`src/data.py`, `src/validate.py`) which are incompatible with TSV formatting and ER pairing logic. We restructure and optimize the repository as follows:
+The initial repository contained generic tabular ML templates (`src/data.py`, `src/utils.py`, `src/validate.py`) that were incompatible with TSV formatting and ER pairing logic. Those, the duplicate `student_resource/` extraction (an identical copy of `dataset/`), the macOS `__MACOSX/` archive metadata, the 1.1 GB source zip, empty `data/`+`notebooks/` folders, and a stale `scripts/eda_explore.py` have been removed. The cleaned structure is:
 
 ```
-amazon-ML/
-├── ROADMAP.md                  # Comprehensive route and execution plan (THIS FILE)
-├── PROJECT.md                  # Project tracker, experiment ledger, EDA insights
-├── CONTEXT.md                  # System prompt / rules of engagement for assistants
-├── problemstatment.md          # Problem specification from organizers
-├── Documentation_template.md   # Official documentation report template
+BuisnessEntityResolutionML/
+├── README.md                   # Setup, CLI guide, measured results
 ├── requirements.txt            # Pinned environment requirements
-├── .gitignore                  # Git hygiene (ignoring large raw data and caches)
+├── Documentation_template.md   # Official documentation report template
+├── .gitignore                  # Git hygiene (data, models, outputs, reports)
+│
+├── docs/                       # Long-form documentation
+│   ├── ROADMAP.md              # Comprehensive route and execution plan (THIS FILE)
+│   ├── PROJECT.md              # Project tracker, experiment ledger, insights
+│   ├── CONTEXT.md              # Rules of engagement for assistants
+│   ├── PROJECT_EXPLAINER.md    # Plain-English design guide
+│   ├── problem_statement.md    # Problem specification from organizers
+│   └── organizer_readme.md     # Organizer resource-pack README
 │
 ├── dataset/                    # Authoritative challenge datasets (TSV, sep="\t")
 │   ├── train/
@@ -49,31 +54,29 @@ amazon-ML/
 │
 ├── src/                        # Core Entity Resolution Pipeline Modules
 │   ├── __init__.py
-│   ├── config.py               # Paths, constants, seeds, tuned thresholds
-│   ├── io.py                   # Chunked TSV ingestion & Ground Truth parsers
-│   ├── normalize.py            # Multilingual/multimodal string & address cleaning
+│   ├── config.py               # Paths, constants, seeds, thresholds, feature flags
+│   ├── io.py                   # Streaming TSV ingestion & Ground Truth parsers
+│   ├── normalize.py            # Multilingual string & address cleaning
 │   ├── blocking.py             # Multi-pass candidate indexing & candidate union
-│   ├── features.py             # Pairwise lexical, phonetic, token & cross-field sim
-│   ├── train.py                # Pairwise LightGBM / CatBoost model & Optuna tuning
-│   ├── evaluate.py             # Macro-F0.5 calculator, threshold sweeper, singleton acc
+│   ├── features.py             # Pairwise lexical, token & cross-field similarity
+│   ├── train.py                # Pairwise LightGBM, hard negatives & Optuna tuning
+│   ├── evaluate.py             # Macro-F0.5 calculator, threshold/barrier sweeper
 │   ├── predict.py              # Test inference generator & per-S1 thresholding
-│   ├── ensemble.py             # Rank / probability blending across model folds
 │   └── pipeline.py             # End-to-end deterministic execution CLI
 │
-├── scripts/                    # Standalone utility & exploration scripts
-│   ├── eda_explore.py          # Fast exploratory profiling script
-│   └── run_mini_benchmark.py   # 10k sample rapid testing sandbox
+├── scripts/                    # Standalone verification & diagnostics
+│   ├── test_model_improvements.py  # 34 synthetic checks (no dataset needed)
+│   └── diagnose_blocking.py        # Explains blocked/missed true matches
 │
-├── output/                     # Generated submission artifacts
+├── output/                     # Generated submission artifacts (gitignored)
 │   ├── matching_results.tsv    # Target predictions (source1_entity_id \t matched_entity_ids)
 │   └── candidate_pairs.tsv     # Candidate pairs (source1_entity_id \t candidate_entity_ids)
 │
 ├── utils/                      # Official challenge verification tools
 │   └── validate_submission.py  # Output syntax and integrity validator
 │
-├── models/                     # Serialized LightGBM models and vectorizers
-├── reports/                    # Generated charts, EDA report, threshold curves
-└── submissions/                # Ready-to-upload ZIP archives
+├── models/                     # Serialized LightGBM models (gitignored)
+└── reports/                    # Generated logs, charts, threshold curves (gitignored)
 ```
 
 ---
@@ -194,6 +197,7 @@ For every candidate pair $(S_1, S_{2/3})$, construct ~28 dense similarity featur
 | **M4: Model Training** | `src/train.py`, LightGBM pair classifier | Supervised binary classification, entity-level CV | ✅ **Completed** | Day 2 (Morning) |
 | **M5: F0.5 Optimization** | `src/evaluate.py`, threshold sweep | Peak Macro $F_{0.5} \ge 0.90$, singleton accuracy $> 95\%$ | ✅ **Completed** | Day 2 (Afternoon) |
 | **M6: Test Inference & QA** | `src/predict.py`, output generator | `validate_submission.py` syntax & logic check | ✅ **Completed** | Day 2 (Evening) |
+| **M6.5: Model Improvements** | Hard negatives (E4), per-source thresholds (E5), dual models (E6), conservative rules (E7), singleton barrier (E8), phonetic/recall blocking fixes; streaming low-RAM sampler | `scripts/test_model_improvements.py` — 34 checks pass; sample run: candidate recall 0.985, macro F0.5 **0.9818** | ✅ **Validated** on a 3,000-S1 sample | Day 3 (Morning) |
 | **M7: Final Packaging** | Clean code under `code/`, `Documentation_template.md`, ZIP | All constraints, license checks, and ZIP integrity verified | 🔄 **In Progress** | Day 3 |
 
 ---
