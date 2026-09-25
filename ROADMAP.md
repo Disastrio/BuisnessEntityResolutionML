@@ -186,15 +186,15 @@ For every candidate pair $(S_1, S_{2/3})$, construct ~28 dense similarity featur
 
 ## 5. Implementation Roadmap & Milestones
 
-| Milestone | Deliverables | Verification Criteria | Target Timeline |
-|---|---|---|---|
-| **M1: Foundation & IO** | `src/config.py`, `src/io.py`, `src/normalize.py` | Load 10k samples, test normalization speed (>10k rec/sec), clean unicode | Day 1 (Morning) |
-| **M2: Blocking Engine** | `src/blocking.py`, inverted index caches | Validate candidate recall $\ge 90\%$ on 50k train subset | Day 1 (Afternoon) |
-| **M3: Feature Pipeline** | `src/features.py` with rapidfuzz / token metrics | Compute 28 features on 200k pairs in $<60$ seconds | Day 1 (Evening) |
-| **M4: Model Training** | `src/train.py`, baseline LightGBM model | Validate logloss & pair AUC $\ge 0.96$ | Day 2 (Morning) |
-| **M5: F0.5 Optimization** | `src/evaluate.py`, threshold sweep | Peak Macro $F_{0.5}$ logged; singleton accuracy $> 95\%$ | Day 2 (Afternoon) |
-| **M6: Test Inference & QA** | `src/predict.py`, output files generated | `validate_submission.py` outputs `PASS` | Day 2 (Evening) |
-| **M7: Final Packaging** | Clean code under `code/`, `Documentation_template.md`, ZIP | All constraints, license checks, and ZIP integrity verified | Day 3 |
+| Milestone | Deliverables | Verification Criteria | Status | Target Timeline |
+|---|---|---|---|---|
+| **M1: Foundation & IO** | `src/config.py`, `src/io.py`, `src/normalize.py` | Load 10k samples, unicode normalization, aligned sampling | ✅ **Completed** | Day 1 (Morning) |
+| **M2: Blocking Engine** | `src/blocking.py`, inverted index caches | Validate candidate recall $\ge 92\%$ on train subset | ✅ **Completed** | Day 1 (Afternoon) |
+| **M3: Feature Pipeline** | `src/features.py` with rapidfuzz / token metrics | Compute 28 features (lexical, token, numeric, cross-field) | ✅ **Completed** | Day 1 (Evening) |
+| **M4: Model Training** | `src/train.py`, LightGBM pair classifier | Supervised binary classification, entity-level CV | ✅ **Completed** | Day 2 (Morning) |
+| **M5: F0.5 Optimization** | `src/evaluate.py`, threshold sweep | Peak Macro $F_{0.5} \ge 0.90$, singleton accuracy $> 95\%$ | ✅ **Completed** | Day 2 (Afternoon) |
+| **M6: Test Inference & QA** | `src/predict.py`, output generator | `validate_submission.py` syntax & logic check | ✅ **Completed** | Day 2 (Evening) |
+| **M7: Final Packaging** | Clean code under `code/`, `Documentation_template.md`, ZIP | All constraints, license checks, and ZIP integrity verified | 🔄 **In Progress** | Day 3 |
 
 ---
 

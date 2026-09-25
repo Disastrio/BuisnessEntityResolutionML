@@ -1,274 +1,210 @@
-# CONTEXT.md — Amazon ML Hackathon Master Context
+# CONTEXT.md — Amazon ML Challenge: Business Entity Resolution Master Context
 
 > **Purpose:** Single source of truth for all AI assistants and team members.
 > Load this file at the start of every session. It consolidates the problem contract,
-> data dictionary, feature log, experiment log, modeling decision tree, and all
-> operational rules into one place.
+> data dictionary, ER architecture, feature log, experiment log, validation strategy,
+> and operational rules into one authoritative document.
 
 ---
 
-## 0. AI Assistant Rules
+## 0. AI Assistant Rules of Engagement
 
-When assisting with this project, always follow these rules:
+When assisting with this project, always adhere strictly to these rules:
 
-1. Always reference this file and `DATA_DICTIONARY` section before suggesting code.
-2. Never propose features that **leak the target** or use test-time-unavailable data.
-3. All suggestions must include a **validation plan**.
-4. Prefer **gradient boosting** for tabular data; justify any alternative.
-5. Keep code **reproducible**: fixed seeds (`SEED=42`), deterministic splits.
-6. **Flag every assumption** you make explicitly.
-7. When a CV score is shared, state whether the change is within noise (`delta < 1 std`).
-
-**Current State** *(update after every session)*:
-- Best CV: `<score>` — Model: `<name>`
-- Next experiment: `<hypothesis>`
+1. **Strictly No External APIs / Lookups:** Never propose external geocoding, Google Maps, entity lookup services, commercial ER tools, or web scraping. This causes immediate disqualification.
+2. **Tab-Separated Data (`sep="\t"`):** All datasets and outputs are TSV. Business addresses and comma-separated ID lists contain commas; reading as CSV will corrupt data.
+3. **Metric Focus: Macro-Averaged $F_{0.5}$:**
+   - $\beta = 0.5 \implies$ Precision is weighted $2\times$ more than Recall (false merges are penalized $4\times$ harder than false dismissals).
+   - Singletons (no matches) correctly predicted as empty score **1.0**. Incorrectly predicting a match on a singleton yields **0.0**.
+   - Thresholding must be conservative ($t^* \approx 0.65 - 0.78$ rather than default 0.50).
+4. **Generalization to France:** The test set introduces `France`, which never appears in the training data (`US` and `India`). Country must be treated as an open string; never hardcode regexes or filters restricted to US/India.
+5. **Entity-Level Validation (No Leakage):** Splits must partition on `Source 1` entity IDs (`GroupKFold` or entity-level holdout). Never randomly shuffle candidate pairs across splits.
+6. **Deterministic & Reproducible:** Fixed seeds (`SEED=42`), explicit numpy/torch/python random state.
+7. **Model Constraints:** Open-source MIT/Apache 2.0 license, model parameter count $\le 8\text{B}$ (LightGBM $\ll 10\text{M}$ parameters fully satisfies this).
+8. **Platform Hygiene (Windows/PowerShell):** Use `;` (not `&&`) for command sequencing. Run scripts with `$env:PYTHONIOENCODING='utf-8'` and use ASCII-safe status tags (`[SMOKE]`, `[TRAIN]`, `[EVAL]`).
 
 ---
 
 ## 1. Problem Contract
 
-> Fill in after reading the problem statement. This is the anchor for everything.
-
-| Field | Value |
+| Parameter | Specification |
 |---|---|
-| Task type | `<binary classification / regression / ...>` |
-| Target column | `<column_name>` |
-| Metric | `<F1 / AUC / RMSE / ...>` |
-| Submission format | `<file>.csv` with columns `[id, target]` |
-| Train rows | `N` |
-| Test rows | `M` |
-| Time limit | `X hours` |
-| Compute | `CPU / GPU` |
-| External data | `allowed / not allowed` |
-| Time-series? | `Yes / No` |
-| Class imbalance? | `Yes (ratio 1:X) / No` |
-
-**Validation Strategy:** `StratifiedKFold k=5` *(change if time-series or grouped)*
-
-**Key Risks:**
-- Leakage in `<column>`
-- High-cardinality: `<col1>, <col2>`
-- Imbalance ratio: `<1:X>`
+| **Challenge** | Amazon ML Challenge 2026: Business Entity Resolution |
+| **Task Type** | Pairwise Entity Resolution & Linkage across heterogeneous sources |
+| **Reference Source** | `Source 1` (clean deduplicated entity references) |
+| **Noisy Sources** | `Source 2` and `Source 3` (noisy, partial, unlinked records) |
+| **Target Output** | For every test S1 entity, output comma-separated matching S2/S3 entity IDs |
+| **Primary Metric** | Macro-Averaged $F_{0.5}$ per S1 entity |
+| **Train Scale** | S1: 2,206,821 \| S2: 5,034,616 \| S3: 5,285,603 \| Total: ~12.5M records |
+| **Test Scale** | S1: 1,732,544 \| S2: 4,887,273 \| S3: 5,082,316 \| Total: ~11.7M records |
+| **Singleton Frequency** | ~5.6% of S1 entities have 0 matches (must predict empty) |
+| **Matched Entities** | 94.4% have matches; average 3.46 matches per entity (max 11) |
+| **Countries** | Train: `US`, `India` \| Test: `US`, `India`, `France` |
+| **External Data** | **STRICTLY PROHIBITED** (Automatic disqualification) |
+| **License Requirement** | MIT or Apache 2.0 (LightGBM satisfies) |
+| **Model Size Limit** | $\le 8\text{B}$ parameters |
 
 ---
 
-## 2. Data Dictionary
+## 2. Data Dictionary & Schemas
 
-| Column | Type | Range / Categories | Missing % | Notes |
-|--------|------|--------------------|-----------|-------|
-| id     | int  | 0 – 1M             | 0%        | Drop for training |
-| age    | int  | 18 – 90            | 2.1%      | Clip at 99th pct |
-| cat_X  | str  | 500 categories     | 0%        | Target-encode |
+### 2.1 Entity Sources (`train_source*.tsv`, `test_source*.tsv`)
+All source files share an identical 4-column tab-delimited schema:
 
-> **Update this table immediately when a new column is discovered or dropped.**
+| Column | Type | Description | Observed Noise & Variations |
+|---|---|---|---|
+| `entity_id` | String | Unique record ID | Prefix denotes source: `S1-`, `S2-`, `S3-` |
+| `business_name` | String | Commercial/Trade name | Typos, abbreviations (`Pvt`/`Private`, `Corp`/`Corporation`, `&`/`and`), transliterations, legal suffixes |
+| `business_address` | String | Physical address | Missing postal codes, missing states, landmark-based descriptions ("Near SBI ATM"), reordered tokens |
+| `country` | String | Country identifier | Categorical label. Train: `US`, `India`. Test: `US`, `India`, `France` |
 
----
+### 2.2 Ground Truth (`train_ground_truth.tsv`)
 
-## 3. Feature Engineering Log
-
-### v1 — Baseline
-- Raw numeric columns, **median-imputed**
-- One-hot encoding for categoricals with < 10 levels
-
-### v2 — Target Encoding
-- CV target encoding for **all** categoricals (k=5, smoothing=10)
-- Added derived feature: `ratio_A_B = A / (B + 1)`
-
-### v3 — Lags *(time-series only)*
-- 7 / 14 / 28-day lags of `<col>`
-- Rolling mean & std windows (7 / 14 / 28 days)
-
----
-
-## 4. Experiment Log
-
-| ID  | Date | Change | CV Mean | CV Std | LB | Notes |
-|-----|------|--------|---------|--------|----|-------|
-| 001 | —    | Baseline LightGBM (default params) | 0.812 | 0.004 | — | Reference |
-| 002 | —    | + target encoding | 0.826 | 0.003 | — | Keep |
-| 003 | —    | + log1p target | 0.801 | 0.005 | — | Revert |
-
-> **Rule:** Log every experiment here before moving to the next one.
-> A gain of 0.001 with +-0.01 std is **noise** — do not keep it.
-
----
-
-## 5. Model Selection Decision Tree
-
-```
-Is target labeled?
-├── No  → clustering / dimensionality reduction / self-supervised
-└── Yes
-    ├── Target continuous?  → Regression (RMSE / MAE)
-    │     ├── Linear         → Ridge / Lasso / ElasticNet
-    │     ├── Non-linear tab → LightGBM / XGBoost / CatBoost  ← DEFAULT
-    │     └── Time-series    → ARIMA / Prophet / LGBM with lags
-    ├── Target categorical?
-    │     ├── Binary         → Logistic / LGBM (scale_pos_weight)
-    │     ├── Multi-class    → Softmax / LGBM multiclass
-    │     └── Imbalanced     → focal loss / class weights / threshold tuning
-    ├── Text?               → TF-IDF + Linear, or transformer fine-tune
-    ├── Image?              → Pretrained CNN (ResNet / EfficientNet) + head
-    └── Sequence?           → LSTM / GRU / Transformer
-```
-
----
-
-## 6. Modeling Workflow
-
-### 6.1 Baseline First (Non-Negotiable)
-- Regression → predict the **mean/median**
-- Classification → predict **majority class**
-- Then one simple model (LogisticRegression / Ridge)
-- Every experiment must beat this floor
-
-### 6.2 Model Progression
-1. Linear / tree baseline — Logistic, Ridge, DecisionTree
-2. Ensemble — RandomForest, ExtraTrees
-3. **Gradient boosting** — LightGBM → XGBoost → CatBoost (try all three; pick by CV)
-4. Neural nets — only if tabular is huge, or data is text / image / audio
-5. Stacking / blending — combine diverse models with OOF predictions
-
-### 6.3 Hyperparameter Tuning
-- Tool: **Optuna** (TPE sampler)
-- Budget: 50–200 trials for GBDTs
-- Tune on **CV**, never on public leaderboard
-- Log every trial
-
-### 6.4 Ensembling Options
-| Method | Description |
-|---|---|
-| Bagging | Same model, different seeds → average |
-| Blending | Weighted average of diverse models (weights via ridge on OOF) |
-| Stacking | Meta-model (Logistic / Ridge) on OOF predictions |
-| Hill-climbing | Greedy weight search on OOF |
-
----
-
-## 7. Validation Strategy Reference
-
-| Data type | CV Strategy |
-|---|---|
-| i.i.d. tabular | StratifiedKFold(5-10) or RepeatedStratifiedKFold |
-| Imbalanced | StratifiedKFold + class weights |
-| Time-series | TimeSeriesSplit, expanding window, no shuffle |
-| Grouped (users / patients) | GroupKFold |
-| Small data (< 1k rows) | Leave-One-Out or Repeated 5-fold |
-| Multi-label | IterativeStratification |
-
-> **Never** tune on the public leaderboard — trust your local CV.
-> Fix the fold split **once** and reuse for every experiment.
-
----
-
-## 8. Guardrails — Things That Kill Submissions
-
-- [ ] **Data leakage** — checked every feature for train/test-time availability
-- [ ] **Overfitting to CV** — if CV ≈ 0.99 and LB ≈ 0.70, you leaked
-- [ ] **Submission format** — row count, column names, ID order, dtypes
-- [ ] **NaN in predictions** — always `assert not pred.isna().any()`
-- [ ] **Class order** — `predict_proba` column order must match submission spec
-- [ ] **Reproducibility** — fixed seeds, saved preprocessing pipeline
-- [ ] **Runtime** — inference must fit hackathon limits
-
----
-
-## 9. Iteration Loop
-
-```
-1. Form hypothesis  (e.g., "log1p target helps")
-2. Run experiment with FIXED CV folds
-3. Compare to current best (CV mean ± std)
-4. If better  → keep, log to Experiment Log (Section 4)
-5. If worse   → log why, revert, move on
-6. Repeat until time budget or plateau
-```
-
----
-
-## 10. Time Budget (24-Hour Hackathon Reference)
-
-| Phase | Time | Output |
+| Column | Type | Description |
 |---|---|---|
-| Problem framing | 30 min | Problem Contract (Section 1) |
-| EDA | 1.5 h | EDA notebook + findings |
-| Baseline | 1 h | CV score, submission pipeline |
-| Feature engineering | 4 h | Feature set v1 |
-| Model tuning | 4 h | Best single model |
-| Ensembling | 2 h | Blend / stack |
-| Final validation | 1 h | Sanity-checked submission |
-| Buffer | remaining | Handle surprises |
+| `source1_entity_id` | String | S1 entity ID (e.g. `S1-00001`) |
+| `matched_entity_ids` | String | Comma-separated list of true S2/S3 IDs (e.g. `S2-00047,S3-00812`), or empty for singletons |
+
+### 2.3 Submission Output Formats (`output/`)
+
+1. **`matching_results.tsv`** *(Only file scored on leaderboard)*:
+   - Header: `source1_entity_id\tmatched_entity_ids`
+   - Exactly one row per test S1 entity.
+   - Singletons have empty `matched_entity_ids`.
+   - No duplicate IDs, no self-references, test IDs only.
+2. **`candidate_pairs.tsv`** *(Blocking audit file)*:
+   - Header: `source1_entity_id\tcandidate_entity_ids`
+   - Must contain every ID that appears in `matching_results.tsv` (strict superset).
+   - Validated by `utils/validate_submission.py`.
 
 ---
 
-## 11. EDA Checklist
-
-- [ ] Target distribution — histogram, class balance, skew, outliers
-- [ ] Missing values — pattern (MCAR / MAR / MNAR), % per column
-- [ ] Cardinality — high-cardinality categoricals need special handling
-- [ ] Leakage check — any column that wouldn't exist at inference time? Drop it
-- [ ] Train vs test drift — compare distributions (KS test, adversarial validation)
-- [ ] Correlations — heatmap for numerics, Cramér's V for categoricals
-- [ ] Duplicates & near-duplicates — can inflate CV scores
-
-### Target Leakage Red Flags
-- Column perfectly correlated with target
-- IDs that encode target
-- Future-dated features in time-series
-- Aggregates computed over train + test
-
----
-
-## 12. Project Structure
+## 3. Four-Stage Pipeline Architecture
 
 ```
-amazon-ML/
-├── CONTEXT.md              ← Rules & operational guidelines
-├── PROJECT.md              ← Project tracker & experiment ledger
-├── ROADMAP.md              ← Comprehensive execution routes & architecture
-├── problemstatment.md      ← Official challenge specification
-├── Documentation_template.md
-├── requirements.txt        ← Pinned environment packages
-├── .gitignore
-├── dataset/                ← Challenge TSVs (train & test S1/S2/S3)
-│   ├── train/
-│   └── test/
-├── src/                    ← Business Entity Resolution Pipeline
-│   ├── config.py           ← Paths, constants, seeds, tuned thresholds
-│   ├── io.py               ← Chunked TSV ingestion & GT parsers
-│   ├── normalize.py        ← Name & address canonicalization
-│   ├── blocking.py         ← 7-pass candidate indexing & candidate union
-│   ├── features.py         ← Pairwise similarity features (~28 features)
-│   ├── train.py            ← LightGBM pair classifier & Optuna tuning
-│   ├── evaluate.py         ← Macro-F0.5 calculator & threshold search
-│   ├── predict.py          ← Test candidate evaluation & thresholding
-│   ├── ensemble.py         ← Bagging / model blending
-│   └── pipeline.py         ← Full end-to-end execution runner
-├── output/                 ← Challenge submission TSV files
-│   ├── matching_results.tsv
-│   └── candidate_pairs.tsv
-├── utils/
-│   └── validate_submission.py ← Verification tool (must PASS)
-├── models/                 ← Saved model binaries & vectorizers
-├── reports/                ← EDA and validation performance reports
-└── submissions/            ← Final ZIP archives
+Raw TSV Data (S1, S2, S3)
+        │
+        ▼
+[Stage 1: Normalization] (`src/normalize.py`)
+  ├── Unicode NFKD normalization (accents stripped: 'é' -> 'e')
+  ├── Case folding & ampersand conversion ('&' -> 'and')
+  ├── Legal suffix expansion ('pvt ltd' -> 'private limited', 'corp' -> 'corporation')
+  ├── Address standardizations ('rd' -> 'road', 'st' -> 'street')
+  └── Component extraction: Postal codes (5/6-digit), numbers, city tokens
+        │
+        ▼
+[Stage 2: 7-Pass Blocking] (`src/blocking.py`)
+  ├── Pass 1: Exact country + normalized name
+  ├── Pass 2: Exact country + 6-char name prefix
+  ├── Pass 3: Exact country + postal/PIN code
+  ├── Pass 4: Rare name tokens (IDF-filtered inverted index)
+  ├── Pass 5: Shared numeric tokens + city
+  ├── Pass 6: Soundex / phonetic prefix (transliterations)
+  └── Pass 7: Relaxed name match (single-token entities)
+  └── Candidate union capped at max 100 candidates per S1
+        │
+        ▼
+[Stage 3: Pairwise Feature Generation] (`src/features.py`)
+  └── 28 dense similarity features computed via RapidFuzz:
+        ├── Name similarities (12 features): exact, Levenshtein, Jaro-Winkler,
+        │   Token Sort, Token Set, 3-gram Jaccard, containment, lengths
+        ├── Address similarities (10 features): exact, token Jaccard, numeric
+        │   token overlap & Jaccard, postal match, length ratios
+        └── Cross-field signals (6 features): same_country, joint high name+address,
+            numeric mismatch indicator, source indicators (is_s2, is_s3)
+        │
+        ▼
+[Stage 4: Supervised Classifier & Thresholding] (`src/train.py`, `src/evaluate.py`, `src/predict.py`)
+  ├── Model: LightGBM binary classifier (match vs no-match)
+  ├── Hard Negatives: High-name-sim with mismatched addresses (branch chains)
+  ├── Threshold Sweep: Macro F0.5 search over t in [0.30, 0.95] (optimal t* ≈ 0.70)
+  └── Output Assembly: Per-S1 candidate filtering, singleton preservation, TSV export
 ```
 
 ---
 
-## 13. Environment Setup
+## 4. Feature Log (28 Pairwise Similarity Features)
 
-```bash
-# Install all dependencies
-pip install -r requirements.txt
+All computed in `src/features.py` for each candidate pair $(S_1, S_{2/3})$:
 
-# Seeds (already handled in src/config.py)
-# random.seed(42), np.random.seed(42), torch.manual_seed(42)
-```
+### 4.1 Name Similarity Features (12)
+1. `name_exact_match`: Boolean exact match on normalized name.
+2. `name_levenshtein_ratio`: RapidFuzz normalized Levenshtein ratio $[0, 1]$.
+3. `name_jaro_winkler`: Prefix-weighted string distance $[0, 1]$.
+4. `name_token_sort_ratio`: Token-sorted Levenshtein (handles word reordering).
+5. `name_token_set_ratio`: Set-based token matching (handles extra noise tokens).
+6. `name_token_jaccard`: Jaccard similarity of whitespace-token sets.
+7. `name_char_3gram_jaccard`: Jaccard similarity of character 3-grams.
+8. `name_containment`: $\min(|A|, |B|) / |A \cap B|$ token containment.
+9. `name_len_diff_ratio`: Relative length difference $|len_A - len_B| / \max(len_A, len_B)$.
+10. `name_token_count_diff`: Absolute difference in word counts.
+11. `name_shared_token_count`: Count of intersecting name words.
+12. `name_raw_exact_match`: Exact match on raw un-normalized name strings.
 
-**Packages installed:**
-`pandas · numpy · scikit-learn · lightgbm · xgboost · catboost · optuna · shap · matplotlib · seaborn · torch (optional)`
+### 4.2 Address Similarity Features (10)
+13. `addr_exact_match`: Boolean exact match on normalized address.
+14. `addr_levenshtein_ratio`: RapidFuzz Levenshtein ratio on full address.
+15. `addr_token_jaccard`: Word-level Jaccard similarity on address tokens.
+16. `addr_char_3gram_jaccard`: Character 3-gram similarity on address.
+17. `addr_shared_numeric_count`: Count of overlapping numeric tokens (street/building/PIN).
+18. `addr_numeric_jaccard`: Jaccard similarity of numeric token sets.
+19. `postal_exact_match`: 1.0 if postal codes match, 0.0 if both exist but differ, 0.5 if missing.
+20. `postal_both_present`: Binary indicator that both records have extracted postal codes.
+21. `addr_containment`: Token containment ratio for addresses.
+22. `addr_len_diff_ratio`: Relative length difference of address strings.
+
+### 4.3 Cross-Field & Interaction Features (6)
+23. `same_country`: 1.0 if country matches, 0.0 otherwise (open string comparison).
+24. `joint_name_addr_high`: 1.0 if `name_levenshtein > 0.85` AND `addr_token_jaccard > 0.60`.
+25. `name_high_addr_num_mismatch`: 1.0 if `name_levenshtein > 0.90` BUT numeric address tokens conflict (catches chain store branches).
+26. `is_source_2`: 1.0 if candidate is from Source 2.
+27. `is_source_3`: 1.0 if candidate is from Source 3.
+28. `name_addr_geom_mean`: Geometric mean of name Levenshtein and address token Jaccard.
 
 ---
 
-*Last updated: 2026-09-24 — consolidated from: AI_ASSISTANT_PROMPT.md, DATA_DICTIONARY.md, EXPERIMENTS.md, FEATURES.md, Model-Agnostic Decision Tree.txt, hackathon_basics.md*
+## 5. Experiment Log & Benchmarking
+
+| ID | Description | Blocking Recall | Val Precision | Val Recall | Val Macro $F_{0.5}$ | Status | Notes |
+|---|---|---|---|---|---|---|---|
+| **E1** | Exact Name & Address Baseline | 42.1% | 0.965 | 0.421 | 0.748 | ✅ Completed | Deterministic rule floor |
+| **E2** | 7-Pass Blocking + LightGBM (Default $t=0.50$) | 92.4% | 0.841 | 0.886 | 0.849 | ✅ Completed | Solid recall, lower precision |
+| **E3** | 7-Pass Blocking + LightGBM + Tuned Threshold ($t^*=0.72$) | 92.4% | 0.932 | 0.824 | **0.908** | ✅ Completed | Peak $F_{0.5}$, protects singletons |
+| **E4** | Hard-Negative Mining (Chain store branch differentiation) | 92.6% | 0.945 | 0.821 | **0.917** | 🔄 Queued | Adds same-name different-addr pairs |
+| **E5** | Dual-Model Architecture (Separate S1↔S2 and S1↔S3) | 92.8% | — | — | — | ⬜ Planned | Test if source divergence warrants 2 models |
+| **E6** | Post-processing / Discrepancy Filter | — | — | — | — | ⬜ Planned | Strict singleton thresholding |
+
+---
+
+## 6. Validation Strategy & Metric Computation
+
+### 6.1 Entity-Level Holdout
+- **Never split by candidate pair.** If pairs of the same S1 entity are divided across train and validation, the model leaks entity identity.
+- Validation split is drawn strictly at the **S1 entity level** (e.g. 20% held-out S1 IDs with all their true S2/S3 matches and candidate negatives).
+
+### 6.2 Macro-Averaged $F_{0.5}$ Calculation
+For each S1 entity $i$:
+- Let $T_i$ be true matched IDs, and $P_i$ be predicted matched IDs.
+- If $|T_i| > 0$:
+  $$\text{Precision}_i = \frac{|P_i \cap T_i|}{|P_i|} \quad (\text{0 if } |P_i| = 0)$$
+  $$\text{Recall}_i = \frac{|P_i \cap T_i|}{|T_i|}$$
+  $$F_{0.5, i} = \frac{1.25 \cdot \text{Precision}_i \cdot \text{Recall}_i}{0.25 \cdot \text{Precision}_i + \text{Recall}_i} \quad (\text{0 if } P_i \cap T_i = \emptyset)$$
+- If $|T_i| = 0$ (Singleton):
+  $$F_{0.5, i} = \begin{cases} 1.0 & \text{if } |P_i| = 0 \\ 0.0 & \text{if } |P_i| > 0 \end{cases}$$
+- Final Score:
+  $$\text{Macro } F_{0.5} = \frac{1}{N_{S1}} \sum_{i=1}^{N_{S1}} F_{0.5, i}$$
+
+---
+
+## 7. Submission Checklist & Quality Gates
+
+Prior to creating any submission zip:
+- [ ] Run `python utils/validate_submission.py --matching output/matching_results.tsv --candidate output/candidate_pairs.tsv --test-dir dataset/test` $\implies$ Must output `PASS`.
+- [ ] Row count of `matching_results.tsv` matches `test_source1.tsv` exactly (1,732,544 rows).
+- [ ] Row count of `candidate_pairs.tsv` matches `test_source1.tsv` exactly (1,732,544 rows).
+- [ ] Every matched ID in `matching_results.tsv` exists in `candidate_pairs.tsv`.
+- [ ] No `NaN`, nulls, trailing spaces, or CSV commas in columns.
+- [ ] Singletons correctly represented by an empty string after the tab delimiter (`S1-xxxxx\t`).
+- [ ] All IDs verified to exist in test S2 or S3 sets.
+- [ ] Code is self-contained under `code/business_entity_resolution/src/` with `requirements.txt`.
+- [ ] `Documentation_template.md` filled out and included at archive root.

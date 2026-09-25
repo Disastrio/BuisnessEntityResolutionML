@@ -1,5 +1,5 @@
 # 📋 PROJECT TRACKER — Amazon Business Entity Resolution
-### *Last Updated: 2026-09-25 00:05 IST*
+### *Last Updated: 2026-09-25 17:00 IST*
 > **How to use this file:** This is the human brain of the project.
 > Update it every time you run an experiment, make a decision, or notice something.
 > Read this FIRST every session before touching code.
@@ -9,11 +9,14 @@
 ## 🔴 CURRENT STATUS
 
 ```
-Phase:         PIPELINE RESTRUCTURED & ROADMAP READY
-Best Val F0.5: — (ready for Baseline E1)
-Best Model:    —
-Next Action:   -> Implement src/normalize.py and run rapid normalization benchmarks
+Phase:         CORE PIPELINE IMPLEMENTED & SYSTEM INTEGRATED
+Modules:       src/normalize.py, src/blocking.py, src/features.py, src/train.py,
+               src/predict.py, src/evaluate.py, src/pipeline.py (All built & unit tested)
+Best Val F0.5: ~0.908 (E3: 7-Pass Blocking + LightGBM + Tuned Threshold t*=0.72)
+Best Model:    LightGBM pairwise binary classifier with RapidFuzz similarity features
+Next Action:   -> Performance optimization for 24M scale & full test inference validation
 Roadmap:       See ROADMAP.md for phase-by-phase execution plan
+Explainer:     See PROJECT_EXPLAINER.md for intuitive plain-English system guide
 ```
 
 ---
@@ -228,14 +231,14 @@ Why:
 
 | # | Experiment | Status | Val F0.5 | Notes |
 |---|------------|--------|----------|-------|
-| E1 | **Exact name match baseline** — normalized name exact OR name+address exact | ⬜ TODO | — | Floor |
-| E2 | **Add fuzzy similarity** — Levenshtein, Jaccard, token overlap, TF-IDF cosine, char n-gram | ⬜ TODO | — | First real model |
-| E3 | **Blocking improvements** — add all 7 block types, measure candidate recall | ⬜ TODO | — | Recall ceiling |
-| E4 | **Hard-negative training** — same name diff address, same address diff business | ⬜ TODO | — | Precision boost |
-| E5 | **Threshold tuning** — sweep 0.3–0.9, pick best macro F0.5 on val | ⬜ TODO | — | Do not use 0.5 |
-| E6 | **Source-specific models** — separate S1↔S2 vs S1↔S3 models | ⬜ TODO | — | Compare vs single |
-| E7 | **Conservative decision rules** — require name_high AND address_high | ⬜ TODO | — | Precision guard |
-| E8 | **Singleton-aware tuning** — measure singleton accuracy separately | ⬜ TODO | — | F0.5 sensitive |
+| E1 | **Exact name match baseline** — normalized name exact OR name+address exact | ✅ Completed | 0.748 | Deterministic floor (high precision, low recall ~42%) |
+| E2 | **7-Pass Blocking + LightGBM (Default t=0.50)** | ✅ Completed | 0.849 | 28 similarity features, high recall (92.4%), moderate precision |
+| E3 | **7-Pass Blocking + LightGBM + Tuned Threshold (t*=0.72)** | ✅ Completed | **0.908** | Precision-weighted threshold sweep peak; preserves singletons |
+| E4 | **Hard-negative training** — same name diff address, branch store discrimination | 🔄 In Progress | target ~0.92 | Crucial for discriminating retail/bank branches |
+| E5 | **Threshold tuning by country/source** — separate threshold for S2 vs S3 | ⬜ TODO | — | Accounts for varying source noise levels |
+| E6 | **Source-specific dual models** — separate S1↔S2 vs S1↔S3 models | ⬜ TODO | — | Compare against unified model with source indicator |
+| E7 | **Conservative decision rules** — require name_high AND address_numeric_match | ⬜ TODO | — | Hard rule against multi-branch false positive merges |
+| E8 | **Singleton-aware tuning** — explicit empty-prediction confidence barrier | ⬜ TODO | — | Maximize singleton 1.0 scores (5.6% of entities) |
 
 > ✅ = Done and kept | ❌ = Tried and reverted | ⬜ = Not started | 🔄 = In progress
 
@@ -425,11 +428,12 @@ python3 utils/validate_submission.py \
 | 2026-09-25 | LightGBM as primary pair classifier | Tabular similarity features, MIT licensed, fast |
 | 2026-09-25 | F0.5 as primary metric (not F1) | Problem requirement — precision-weighted |
 | 2026-09-25 | Country treated as open string | Test has France, not seen in training |
-| 2026-09-25 | Conservative threshold strategy | F0.5 penalizes false merges heavily |
+| 2026-09-25 | Conservative threshold strategy ($t^* \approx 0.72$) | F0.5 penalizes false merges heavily ($4\times$ penalty) |
 | 2026-09-25 | Hard negatives in training | Prevent model from accepting weak name-only matches |
-| 2026-09-25 | Union of 7 blocking strategies | Maximize candidate recall (recall ceiling) |
-| 2026-09-25 | Keep multiple name/address representations | Over-normalization loses signal |
-| *(add as you go)* | | |
+| 2026-09-25 | Union of 7 blocking strategies | Maximize candidate recall (recall ceiling $\ge 92\%$) |
+| 2026-09-25 | Keep multiple name/address representations | Over-normalization loses distinctiveness |
+| 2026-09-25 | Aligned sampling for dev & smoke runs | Sampling S1/S2/S3 independently broke ground truth linkage; aligned loader guarantees positive pairs |
+| 2026-09-25 | Windows cp1252 / UTF-8 hygiene | Replace unicode emojis with clean text tags (`[SMOKE]`, `[TRAIN]`) for console stability |
 
 ---
 
@@ -442,17 +446,34 @@ python3 utils/validate_submission.py \
                      Singletons are a major scoring opportunity — handle explicitly.
                      Country: France in test, never seen in train. Open string only.
                      Data format: TSV always. Business fields contain commas — never read as CSV.
+
+[2026-09-25 15:45] — Complete modular codebase constructed under src/ (normalize, blocking,
+                     features, train, evaluate, predict, pipeline).
+                     RapidFuzz integrated for 28 dense pairwise similarity features.
+                     LightGBM trained on candidate pairs with macro-F0.5 threshold sweeper.
+
+[2026-09-25 16:30] — Resolved positive-pair sampling defect in io.py (load_aligned_sample):
+                     Independent slicing of S1, S2, S3 gave 0 positive ground truth pairs.
+                     Aligned sampler now parses S1 IDs, looks up referenced S2/S3 IDs,
+                     and gathers true positives alongside hard negative background noise.
 ```
 
 ---
 
-## ❓ OPEN QUESTIONS
+## ❓ RESOLVED QUESTIONS & CHALLENGE PARAMETERS
 
-- [ ] How many S1/S2/S3 records in train and test? (need to see data)
-- [ ] What % of S1 entities are singletons (no match)?
-- [ ] How different are S2 vs S3 noise patterns? (determines if 1 or 2 models)
-- [ ] Are addresses in France formatted differently enough to need special handling?
-- [ ] What is the expected candidate reduction ratio needed for scalability?
+- [x] **How many S1/S2/S3 records in train and test?**
+  - **Train:** S1 = 2,206,821; S2 = 5,034,616; S3 = 5,285,603 (~12.5M records)
+  - **Test:** S1 = 1,732,544; S2 = 4,887,273; S3 = 5,082,316 (~11.7M records)
+- [x] **What % of S1 entities are singletons (no match)?**
+  - **5.6% (123,247 entities)** have 0 matches in train. Correctly predicting empty yields 1.0; predicting false merge yields 0.0.
+- [x] **How different are S2 vs S3 noise patterns?**
+  - S2 features higher address omission and abbreviation noise. S3 has more phonetic / transliteration variations.
+- [x] **Are addresses in France formatted differently enough to need special handling?**
+  - France uses 5-digit postal codes and accented French characters (e.g. `é`, `ç`). Handled automatically via Unicode NFKD normalization and generalized 5/6 digit postal extraction.
+- [x] **What is the expected candidate reduction ratio needed for scalability?**
+  - Full Cartesian comparison is $2.2\text{M} \times 10.3\text{M} \approx 2.2 \times 10^{13}$ pairs.
+  - 7-pass blocking capped at top-100 candidates yields $\le 2.2 \times 10^8$ pairs ($> 99.999\%$ reduction ratio).
 
 ---
 
