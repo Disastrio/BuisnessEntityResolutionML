@@ -43,6 +43,7 @@ from src.train import (
 from src.evaluate import (
     infer_source, assemble_predictions, threshold_sweep,
     threshold_sweep_by_source, sweep_singleton_barrier, macro_fbeta,
+    threshold_sweep_for_precision,
 )
 from src.predict import (
     conservative_reject_mask, assemble_matches,
@@ -713,6 +714,21 @@ def test_normalization_fixes():
           normalize_address("Sec 14 Phase 2"))
 
 
+def test_precision_targeting():
+    print("\n[15] Precision-first threshold selection")
+    s1 = ["S1-1", "S1-1", "S1-1", "S1-2"]
+    tgt = ["S2-1", "S2-2", "S2-3", "S3-1"]
+    probs = np.array([0.99, 0.96, 0.60, 0.90])
+    gt = {"S1-1": {"S2-1"}, "S1-2": set()}
+    t, score, results = threshold_sweep_for_precision(
+        s1, tgt, probs, gt, min_precision=0.99,
+        thresholds=[0.5, 0.9, 0.97, 0.995])
+    chosen = next(r for r in results if r["threshold"] == t)
+    check("precision target respected",
+          chosen["pair_precision"] >= 0.99 and abs(score - 1.0) < 1e-9,
+          f"t={t} P={chosen['pair_precision']} F={score}")
+
+
 def main():
     print("=" * 70)
     print("  Model Improvement Verification (E4-E8 + Index 6)")
@@ -731,6 +747,7 @@ def main():
     test_resume_inference()
     test_normalize_equivalence()
     test_normalization_fixes()
+    test_precision_targeting()
 
     print("\n" + "=" * 70)
     print(f"  RESULT: {_PASS} passed, {_FAIL} failed")

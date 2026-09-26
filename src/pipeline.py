@@ -54,7 +54,7 @@ from src.train import (
     identify_hard_negatives,
 )
 from src.evaluate import (
-    detailed_evaluation, threshold_sweep,
+    detailed_evaluation, threshold_sweep, threshold_sweep_for_precision,
     assemble_predictions, threshold_sweep_by_source, sweep_singleton_barrier,
 )
 from src.predict import (
@@ -89,6 +89,8 @@ def run_training(
     max_candidates: Optional[int] = None,
     workers: Optional[int] = None,
     neg_ratio: Optional[float] = None,
+    min_precision: Optional[float] = None,
+    force_rules: bool = False,
 ):
     """
     Full training pipeline:
@@ -285,19 +287,25 @@ def run_training(
     use_rules = False
     if USE_CONSERVATIVE_RULES:
         candidate_reject = conservative_reject_mask(X_val)
-        _, score_without, _ = threshold_sweep(
-            s1_val, t_val, val_probs, val_gt, n_workers=FEATURE_WORKERS)
-        _, score_with, _ = threshold_sweep(
-            s1_val, t_val, val_probs, val_gt, reject_mask=candidate_reject,
-            n_workers=FEATURE_WORKERS)
-        if score_with > score_without + 1e-9:
+        if force_rules:
             val_reject = candidate_reject
             use_rules = True
-            print(f"  [E7] Conservative rules KEPT "
-                  f"({score_with:.6f} > {score_without:.6f})")
+            print(f"  [E7] Conservative rules FORCED on "
+                  f"({int(candidate_reject.sum()):,} risky pairs rejected)")
         else:
-            print(f"  [E7] Conservative rules rejected "
-                  f"({score_with:.6f} <= {score_without:.6f})")
+            _, score_without, _ = threshold_sweep(
+                s1_val, t_val, val_probs, val_gt, n_workers=FEATURE_WORKERS)
+            _, score_with, _ = threshold_sweep(
+                s1_val, t_val, val_probs, val_gt, reject_mask=candidate_reject,
+                n_workers=FEATURE_WORKERS)
+            if score_with > score_without + 1e-9:
+                val_reject = candidate_reject
+                use_rules = True
+                print(f"  [E7] Conservative rules KEPT "
+                      f"({score_with:.6f} > {score_without:.6f})")
+            else:
+                print(f"  [E7] Conservative rules rejected "
+                      f"({score_with:.6f} <= {score_without:.6f})")
 
     # E5: per-source thresholds vs a single global threshold
     thresholds_by_source = None
@@ -307,9 +315,19 @@ def run_training(
         best_thresh = max(thresholds_by_source.values())
         print(f"  [E5] Per-source thresholds: {thresholds_by_source}")
     else:
-        best_thresh, best_score, sweep = threshold_sweep(
-            s1_val, t_val, val_probs, val_gt, reject_mask=val_reject,
-            n_workers=FEATURE_WORKERS)
+        if min_precision is not None:
+            best_thresh, best_score, sweep = threshold_sweep_for_precision(
+                s1_val, t_val, val_probs, val_gt, min_precision=min_precision,
+                reject_mask=val_reject)
+            chosen = next((r for r in sweep if r['threshold'] == best_thresh), None)
+            if chosen:
+                print(f"  [precision-first] target P>={min_precision}: "
+                      f"t={best_thresh} P={chosen['pair_precision']} "
+                      f"R={chosen['pair_recall']} F0.5={chosen['macro_fbeta']}")
+        else:
+            best_thresh, best_score, sweep = threshold_sweep(
+                s1_val, t_val, val_probs, val_gt, reject_mask=val_reject,
+                n_workers=FEATURE_WORKERS)
     print(f"  Best threshold: {best_thresh}")
     print(f"  Best macro F0.5: {best_score:.6f}")
 
@@ -362,6 +380,8 @@ def run_training(
         'dual_model': dual_models is not None,
         'max_candidates': max_candidates,
         'neg_ratio': neg_ratio,
+        'min_precision': min_precision,
+        'forced_rules': force_rules,
         'tuned_macro_f05': best_score,
     }
 
@@ -599,6 +619,16 @@ def main():
         help='Train: max negatives per positive (keeps all positives + hard '
              'negatives). Bounds memory on small-RAM machines, e.g. 10'
     )
+    parser.add_argument(
+        '--min-precision', type=float, default=None,
+        help='Train: choose the threshold meeting this pair-precision target '
+             '(precision-first tuning), e.g. 0.99'
+    )
+    parser.add_argument(
+        '--force-rules', action='store_true',
+        help='Train: always apply conservative rules (reject high-name / '
+             'no-address risky pairs)'
+    )
     args = parser.parse_args()
 
     train_kwargs = dict(
@@ -610,6 +640,8 @@ def main():
         max_candidates=args.max_candidates,
         workers=args.workers,
         neg_ratio=args.neg_ratio,
+        min_precision=args.min_precision,
+        force_rules=args.force_rules,
     )
 
     if args.mode == 'smoke':

@@ -217,6 +217,20 @@ The model improvements are opt-in so the validated E3 baseline stays reproducibl
 | `--no-rules` | E7 | Disable the conservative high-name/no-address rejection rule |
 | `--barrier <p>` | E8 | Singleton confidence-barrier floor (tuned upward on validation) |
 | `--workers N` | — | Process pool size for normalize/blocking/features/sweeps (default: CPU count) |
+| `--neg-ratio K` | — | Train: cap easy negatives at K per positive (bounds memory) |
+| `--min-precision P` | — | Train: pick the threshold meeting pair-precision ≥ P (precision-first), e.g. `0.99` |
+| `--force-rules` | — | Train: always reject high-name / no-address risky pairs |
+
+### Precision-first tuning (F0.5 weights precision 2×)
+```bash
+# require 99% pair precision, then maximize recall/F0.5 under that constraint
+python -m src.pipeline --mode train --sample 100000 --max-candidates 50 \
+    --min-precision 0.99 --force-rules
+```
+`--min-precision` selects the highest threshold whose validation pair precision is
+at least P (falling back to the most precise threshold if none qualifies).
+`--force-rules` additionally hard-rejects near-identical-name pairs with zero
+address/postal evidence — the classic false-merge pattern.
 
 ### Running on multi-core local hardware
 The pipeline scales process pools to the CPU count (`ER_WORKERS` env or `--workers`

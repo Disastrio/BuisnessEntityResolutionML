@@ -467,6 +467,69 @@ def sweep_singleton_barrier(
     return best_barrier, best_score, sweep_results
 
 
+def _pair_pr(ground_truth: Dict[str, Set[str]],
+             predictions: Dict[str, Set[str]]) -> Tuple[float, float]:
+    """Aggregate pair-level precision/recall over non-singleton S1 entities."""
+    tp = fp = fn = 0
+    for s1_id, true in ground_truth.items():
+        if not true:
+            continue
+        pred = predictions.get(s1_id, set())
+        tp += len(pred & true)
+        fp += len(pred - true)
+        fn += len(true - pred)
+    precision = tp / (tp + fp) if (tp + fp) else 1.0
+    recall = tp / (tp + fn) if (tp + fn) else 0.0
+    return precision, recall
+
+
+def threshold_sweep_for_precision(
+    s1_ids: List[str],
+    target_ids: List[str],
+    probabilities: np.ndarray,
+    ground_truth: Dict[str, Set[str]],
+    min_precision: float = 0.99,
+    thresholds: Optional[List[float]] = None,
+    beta: float = BETA,
+    reject_mask: Optional[np.ndarray] = None,
+    barrier: float = 0.0,
+) -> Tuple[float, float, List[dict]]:
+    """
+    Choose the decision threshold that meets a MINIMUM PRECISION target while
+    maximizing macro F0.5 (precision-first tuning).
+
+    F0.5 weights precision 2x, so this is often preferable to a raw F0.5 sweep.
+    If no threshold reaches `min_precision`, the highest-precision threshold is
+    returned.
+
+    Returns:
+        (best_threshold, best_macro_fbeta, results)
+    """
+    if thresholds is None:
+        thresholds = [round(t, 2) for t in np.arange(0.30, 1.0, 0.01)]
+    thresholds = [float(t) for t in thresholds]
+
+    results: List[dict] = []
+    best_feasible: Optional[Tuple[float, float]] = None
+    for t in thresholds:
+        preds = assemble_predictions(
+            s1_ids, target_ids, probabilities, threshold=t,
+            all_s1_ids=set(ground_truth.keys()), barrier=barrier,
+            reject_mask=reject_mask)
+        score = macro_fbeta(ground_truth, preds, beta)
+        prec, rec = _pair_pr(ground_truth, preds)
+        results.append({'threshold': t, 'macro_fbeta': round(score, 6),
+                        'pair_precision': round(prec, 6),
+                        'pair_recall': round(rec, 6)})
+        if prec >= min_precision and (best_feasible is None or score > best_feasible[1]):
+            best_feasible = (t, score)
+
+    if best_feasible is None:
+        top = max(results, key=lambda r: (r['pair_precision'], r['macro_fbeta']))
+        return top['threshold'], top['macro_fbeta'], results
+    return best_feasible[0], best_feasible[1], results
+
+
 def apply_threshold(
     s1_ids: List[str],
     target_ids: List[str],
