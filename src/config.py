@@ -139,6 +139,15 @@ SOUNDEX_LENGTH          = 4
 # Blocking: distinctive name-trigram index (typo/transliteration recall).
 USE_TRIGRAM_BLOCK       = True
 
+# Blocking: MinHash-LSH Forest over name character shingles (typo/reorder recall).
+# Measured on a 20k sample: no recall gain over trigram/exact blocks and slower
+# index build, so disabled in favour of sparse-dot top-N retrieval.
+USE_MINHASH_LSH         = False
+MINHASH_K               = 64    # signature length
+MINHASH_BANDS           = 16    # b bands
+MINHASH_ROWS            = 4     # r rows per band  (b*r must equal K)
+MINHASH_SHINGLE         = 4     # character shingle size
+
 if __name__ == "__main__":
     print(f"Config initialized successfully. Root: {ROOT}")
     print(f"Train dir exists: {TRAIN_DIR.exists()}")

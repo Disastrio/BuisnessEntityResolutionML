@@ -25,6 +25,7 @@ from typing import Dict, Set, List, Tuple, Optional
 import os
 import re
 import math
+import zlib
 import multiprocessing as mp
 
 import numpy as np
@@ -34,6 +35,7 @@ from tqdm import tqdm
 from src.config import (
     MAX_CANDIDATES, ID_COL, USE_PHONETIC_BLOCK, SOUNDEX_LENGTH, BLOCK_FETCH_CAP,
     USE_TRIGRAM_BLOCK, MAX_BUCKET_IDS,
+    USE_MINHASH_LSH, MINHASH_K, MINHASH_BANDS, MINHASH_ROWS, MINHASH_SHINGLE,
 )
 
 
@@ -295,7 +297,7 @@ def build_candidate_indices(
     idx = {name: defaultdict(list) for name in (
         'exact_name', 'name_prefix', 'postal', 'rare_tokens', 'addr_numerics',
         'soundex', 'num_single', 'addr_rare', 'trigram', 'relaxed_name',
-        'tokenset', 'postal3')}
+        'tokenset', 'postal3', 'minhash')}
 
     ids = target_df[ID_COL].to_numpy()
     names = target_df['name_clean'].to_numpy()
@@ -333,6 +335,11 @@ def build_candidate_indices(
             if ts:
                 idx['tokenset'][
                     f"{country}|tset|{'_'.join(sorted(ts.split()))}"].append(eid)
+            if USE_MINHASH_LSH:
+                sig = _minhash_signature(_shingle_hashes(name))
+                if sig is not None:
+                    for bk in _band_keys(sig):
+                        idx['minhash'][f"{country}|mh|{bk}"].append(eid)
         if use_rt:
             ts = str(tokens_col[i]).strip()
             if ts:
@@ -476,6 +483,17 @@ def _candidates_from_components(comp: dict, indices, rare_tokens,
     block_lists.append(
         fetch('tokenset', f"{country}|tset|{'_'.join(sorted(comp['tokens']))}")
         if comp['tokens'] else [])
+    if USE_MINHASH_LSH and comp['name']:
+        sig = _minhash_signature(_shingle_hashes(comp['name']))
+        if sig is not None:
+            mh: List[str] = []
+            for bk in _band_keys(sig):
+                mh.extend(fetch('minhash', f"{country}|mh|{bk}"))
+            block_lists.append(mh)
+        else:
+            block_lists.append([])
+    else:
+        block_lists.append([])
     if rare_tokens:
         rare: List[str] = []
         for tok in comp['tokens']:
@@ -594,6 +612,40 @@ def compute_rare_trigrams(
             doc_freq[gram] += 1
     max_count = max(1, int(n_docs * max_doc_frac))
     return {g for g, f in doc_freq.items() if min_freq <= f <= max_count}
+
+
+# ── MinHash-LSH over name character shingles (typo/reorder recall) ────────────
+_LSH_P = (1 << 31) - 1
+
+
+def _lsh_params(k: int, seed: int = 1234):
+    rng = np.random.RandomState(seed)
+    a = rng.randint(1, _LSH_P, size=k, dtype=np.int64)
+    b = rng.randint(0, _LSH_P, size=k, dtype=np.int64)
+    return a, b
+
+
+_MH_A, _MH_B = _lsh_params(MINHASH_K)
+
+
+def _shingle_hashes(text: str, n: int = MINHASH_SHINGLE):
+    s = re.sub(r'\s+', '', text)
+    if not s:
+        return None
+    grams = ({s} if len(s) < n else {s[i:i + n] for i in range(len(s) - n + 1)})
+    return np.array([zlib.crc32(g.encode('utf-8')) & 0x7fffffff for g in grams],
+                    dtype=np.int64)
+
+
+def _minhash_signature(hashes):
+    if hashes is None or len(hashes) == 0:
+        return None
+    return ((_MH_A[:, None] * hashes[None, :] + _MH_B[:, None]) % _LSH_P).min(axis=1)
+
+
+def _band_keys(sig, bands: int = MINHASH_BANDS, rows: int = MINHASH_ROWS):
+    return [zlib.crc32(sig[i * rows:(i + 1) * rows].tobytes()) & 0xffffffff
+            for i in range(bands)]
 
 
 def build_all_indices(s2_df: pd.DataFrame, s3_df: pd.DataFrame) -> Dict[str, object]:
