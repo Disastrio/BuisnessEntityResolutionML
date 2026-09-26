@@ -3,6 +3,7 @@ config.py — Master Configuration for Business Entity Resolution.
 Consolidates paths, seeds, thresholds, and execution hyperparameters.
 """
 from pathlib import Path
+import os
 import random
 import numpy as np
 
@@ -60,7 +61,16 @@ METRIC         = "macro_f0_5"
 BETA           = 0.5                     # Precision weight in F-beta
 DEFAULT_THRESH = 0.70                    # Conservative starting threshold for F0.5
 MAX_CANDIDATES = 100                     # Max candidate pairs to retain per S1 record
-BLOCK_FETCH_CAP = 500                    # Max IDs pulled per block per S1 (bounds work)
+BLOCK_FETCH_CAP = 1000                   # Max IDs pulled per block per S1 (bounds work)
+
+# ── Streaming Inference ───────────────────────────────────────────────────────
+PREDICT_CHUNK_SIZE = 20_000              # S1 entities scored per streaming chunk
+PREDICT_LIMIT_S1   = None                # score only first N S1 (None = all)
+
+# ── Parallelism ───────────────────────────────────────────────────────────────
+# Worker processes for the per-pair feature loop (>1 uses fork on Linux/macOS;
+# Windows automatically falls back to serial).
+FEATURE_WORKERS    = max(1, (os.cpu_count() or 1))
 
 # ── Model Improvement Hyperparameters (Experiments E4-E8) ─────────────────────
 # Thresholds used to recognise boundary cases.
@@ -96,6 +106,9 @@ SINGLETON_BARRIER       = 0.0
 # Blocking: phonetic (Soundex) index (Index 6) - transliteration / typo recovery.
 USE_PHONETIC_BLOCK      = True
 SOUNDEX_LENGTH          = 4
+
+# Blocking: distinctive name-trigram index (typo/transliteration recall).
+USE_TRIGRAM_BLOCK       = True
 
 if __name__ == "__main__":
     print(f"Config initialized successfully. Root: {ROOT}")

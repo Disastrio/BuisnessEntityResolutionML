@@ -16,11 +16,12 @@ import lightgbm as lgb
 
 from src.config import (
     ID_COL, GT_S1_COL, GT_MATCH_COL, CAND_MATCH_COL,
-    MATCHING_OUT, CANDIDATE_OUT, DEFAULT_THRESH,
+    MATCHING_OUT, CANDIDATE_OUT, DEFAULT_THRESH, MAX_CANDIDATES,
     NAME_VERY_HIGH_THRESHOLD, ADDR_WEAK_THRESHOLD,
 )
-from src.features import FEATURE_NAMES
+from src.features import FEATURE_NAMES, build_feature_matrix, TargetLookup
 from src.evaluate import assemble_predictions, infer_source
+from src.blocking import build_all_indices, generate_candidates_from_bundle
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -201,6 +202,159 @@ def save_candidate_pairs(
     print(f"  Candidate pairs saved → {output_path}")
     print(f"    Total S1 entities: {len(df)}")
     print(f"    Avg candidates per S1: {df[CAND_MATCH_COL].apply(lambda x: len(x.split(',')) if x else 0).mean():.1f}")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Streaming (Chunked) Inference
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TsvListWriter:
+    """
+    Streaming writer for the two-column submission format::
+
+        source1_entity_id<TAB>id1,id2,...
+
+    IDs are sorted for deterministic output; an empty list is written as an
+    empty field (the required singleton representation).
+    """
+
+    def __init__(self, path, second_column: str):
+        self.path = path
+        self._f = open(path, 'w', encoding='utf-8', newline='')
+        self._f.write(f"{GT_S1_COL}\t{second_column}\n")
+
+    def write(self, s1_id: str, ids: Set[str]) -> None:
+        payload = ','.join(sorted(ids)) if ids else ''
+        self._f.write(f"{s1_id}\t{payload}\n")
+
+    def close(self) -> None:
+        self._f.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def run_chunked_inference(
+    s1_df: pd.DataFrame,
+    s2_df: pd.DataFrame,
+    s3_df: pd.DataFrame,
+    score_fn,
+    threshold: float = DEFAULT_THRESH,
+    thresholds_by_source: Optional[Dict[str, float]] = None,
+    barrier: float = 0.0,
+    use_rules: bool = True,
+    max_candidates: int = MAX_CANDIDATES,
+    chunk_size: int = 20_000,
+    matching_path=MATCHING_OUT,
+    candidate_path=CANDIDATE_OUT,
+    limit_s1: Optional[int] = None,
+    n_workers: int = 1,
+    show_progress: bool = True,
+) -> dict:
+    """
+    Chunked, streaming test-set inference.
+
+    Peak memory stays proportional to `chunk_size` (plus the fixed cost of the
+    target frame and blocking indices) because candidates, features and
+    predictions are materialised one S1 chunk at a time and written straight to
+    disk, rather than holding every candidate pair for all ~1.7M S1 entities.
+
+    Args:
+        s1_df/s2_df/s3_df: normalized frames (see
+            `src.features.restrict_to_core_columns`).
+        score_fn: callable(features_df, target_ids) -> np.ndarray of P(match).
+        chunk_size: number of S1 entities processed per chunk.
+        limit_s1: optionally score only the first N S1 entities (smoke runs).
+        matching_path/candidate_path: output TSV destinations.
+
+    Returns:
+        Summary dict with counts and lightweight integrity checks.
+    """
+    from tqdm import tqdm
+
+    s1 = s1_df.reset_index(drop=True)
+    if limit_s1 is not None:
+        s1 = s1.iloc[:limit_s1]
+    if len(s1) == 0:
+        raise ValueError("No S1 entities to score.")
+
+    # Fixed cost: target frame + blocking indices, built exactly once.
+    target_df = pd.concat([s2_df, s3_df], ignore_index=True)
+    lookup = TargetLookup(target_df)
+    bundle = build_all_indices(s2_df, s3_df)
+
+    total_s1 = 0
+    entities_with_matches = 0
+    total_matches = 0
+    total_candidates = 0
+    superset_violations = 0
+
+    starts = list(range(0, len(s1), chunk_size))
+    iterator = starts
+    if show_progress:
+        iterator = tqdm(starts, desc="Inference chunks")
+
+    with TsvListWriter(matching_path, GT_MATCH_COL) as mw, \
+            TsvListWriter(candidate_path, CAND_MATCH_COL) as cw:
+        for start in iterator:
+            chunk = s1.iloc[start:start + chunk_size]
+            chunk_ids = set(chunk[ID_COL])
+
+            candidates = generate_candidates_from_bundle(
+                chunk, bundle, max_candidates=max_candidates,
+                show_progress=False, n_workers=n_workers)
+
+            features, s1_ids, target_ids = build_feature_matrix(
+                chunk, target_df, candidates,
+                show_progress=False, target_lookup=lookup, n_workers=n_workers,
+            )
+
+            if len(features) > 0:
+                features = features.astype(np.float32, copy=False)
+                probs = np.asarray(score_fn(features, target_ids), dtype=np.float64)
+                reject_mask = (conservative_reject_mask(features)
+                               if use_rules else None)
+            else:
+                probs = np.array([], dtype=np.float64)
+                reject_mask = None
+
+            matches = assemble_matches(
+                s1_ids, target_ids, probs, threshold, chunk_ids,
+                thresholds_by_source=thresholds_by_source,
+                barrier=barrier,
+                reject_mask=reject_mask,
+            )
+            cand_lists = assemble_candidates(s1_ids, target_ids, chunk_ids)
+
+            for s1_id in sorted(chunk_ids):
+                m = matches.get(s1_id, set())
+                c = cand_lists.get(s1_id, set())
+                if not m <= c:
+                    superset_violations += 1
+                mw.write(s1_id, m)
+                cw.write(s1_id, c)
+                total_s1 += 1
+                total_matches += len(m)
+                total_candidates += len(c)
+                if m:
+                    entities_with_matches += 1
+
+            # Release this chunk's memory before the next one.
+            del candidates, features, matches, cand_lists, probs, target_ids, s1_ids
+
+    return {
+        's1_written': total_s1,
+        'entities_with_matches': entities_with_matches,
+        'total_matches': total_matches,
+        'total_candidates': total_candidates,
+        'avg_candidates_per_s1': (
+            round(total_candidates / total_s1, 2) if total_s1 else 0.0
+        ),
+        'superset_violations': superset_violations,
+    }
 
 
 # ═════════════════════════════════════════════════════════════════════════════

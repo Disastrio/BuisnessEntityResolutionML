@@ -10,8 +10,10 @@ Handles:
 - Whitespace and punctuation cleanup
 - Maintains both raw and normalized representations to avoid over-normalization
 """
+import os
 import re
 import unicodedata
+import multiprocessing as mp
 from typing import Tuple, Optional
 
 import numpy as np
@@ -284,12 +286,34 @@ def normalize_dataframe(df: pd.DataFrame, source_label: str = "") -> pd.DataFram
     return out
 
 
+# Module-level state for forked normalization workers (populated in the parent).
+_NORM_CTX: dict = {}
+
+
+def _normalize_worker(label: str) -> pd.DataFrame:
+    return normalize_dataframe(_NORM_CTX[label], source_label=label)
+
+
 def normalize_all_sources(
     s1: pd.DataFrame,
     s2: pd.DataFrame,
     s3: pd.DataFrame,
+    n_workers: int = 1,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Normalize all three source DataFrames, tagging each with source label."""
+    """
+    Normalize all three source DataFrames, tagging each with source label.
+
+    With n_workers > 1 (fork only), S1/S2/S3 are normalized concurrently in
+    separate processes so the three independent sources use multiple cores.
+    """
+    if n_workers and n_workers > 1 and hasattr(os, 'fork'):
+        global _NORM_CTX
+        _NORM_CTX = {'S1': s1, 'S2': s2, 'S3': s3}
+        ctx = mp.get_context('fork')
+        with ctx.Pool(processes=3) as pool:
+            s1_norm, s2_norm, s3_norm = pool.map(_normalize_worker, ['S1', 'S2', 'S3'])
+        return s1_norm, s2_norm, s3_norm
+
     s1_norm = normalize_dataframe(s1, source_label='S1')
     s2_norm = normalize_dataframe(s2, source_label='S2')
     s3_norm = normalize_dataframe(s3, source_label='S3')

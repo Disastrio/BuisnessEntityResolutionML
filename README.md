@@ -175,12 +175,36 @@ python -m src.pipeline --mode train --sample 100000
 python -m src.pipeline --mode train
 ```
 
-### Mode C: Test Set Inference & Output Generation
-Generates candidates, evaluates features, applies the tuned threshold $t^* \approx 0.72$, and writes `output/matching_results.tsv` and `output/candidate_pairs.tsv`:
+### Mode C: Test Set Inference & Output Generation (streaming)
+Scores S1 in **chunks**, writing `output/matching_results.tsv` and
+`output/candidate_pairs.tsv` incrementally, so peak memory scales with
+`--chunk-size` rather than with the full ~1.7M S1 / ~11.7M total test records:
 
 ```bash
 python -m src.pipeline --mode predict
 ```
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--chunk-size N` | `20000` | S1 entities scored (and written) per chunk |
+| `--limit-s1 N` | all | Score only the first N S1 entities (staged / smoke runs) |
+
+```bash
+# Conservative 16 GB box: smaller chunks
+python -m src.pipeline --mode predict --chunk-size 10000
+
+# Quick staged check that streams every phase without a full run
+python -m src.pipeline --mode predict --limit-s1 5000
+```
+
+> **Full test-set inference** needs ~10 GB free disk. The blocking indices and the
+> in-memory S2/S3 target frame are the fixed cost; if that exceeds RAM, either
+> raise `--chunk-size`-independent memory by adding RAM or shard the target sources.
+> After a full run, always validate:
+> ```bash
+> python utils/validate_submission.py --matching output/matching_results.tsv \
+>     --candidate output/candidate_pairs.tsv --test-dir dataset/test
+> ```
 
 ### Mode D: Advanced Model Options (Experiments E4–E8)
 The model improvements are opt-in so the validated E3 baseline stays reproducible.
@@ -220,8 +244,8 @@ python scripts/test_model_improvements.py
 
 It checks the phonetic blocking index, hard-negative weighting, per-source threshold
 tuning, the singleton barrier, conservative rules, dual-model save/load, the
-round-robin candidate cap, and the official submission validator end-to-end
-(34 checks).
+round-robin candidate cap, the streamed `TargetLookup`, and chunked inference output
+formatting, plus the official submission validator end-to-end (45 checks).
 
 To understand *why* the blocker misses true matches on a real sample, run:
 

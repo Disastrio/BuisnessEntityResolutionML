@@ -197,7 +197,8 @@ For every candidate pair $(S_1, S_{2/3})$, construct ~28 dense similarity featur
 | **M4: Model Training** | `src/train.py`, LightGBM pair classifier | Supervised binary classification, entity-level CV | ✅ **Completed** | Day 2 (Morning) |
 | **M5: F0.5 Optimization** | `src/evaluate.py`, threshold sweep | Peak Macro $F_{0.5} \ge 0.90$, singleton accuracy $> 95\%$ | ✅ **Completed** | Day 2 (Afternoon) |
 | **M6: Test Inference & QA** | `src/predict.py`, output generator | `validate_submission.py` syntax & logic check | ✅ **Completed** | Day 2 (Evening) |
-| **M6.5: Model Improvements** | Hard negatives (E4), per-source thresholds (E5), dual models (E6), conservative rules (E7), singleton barrier (E8), phonetic/recall blocking fixes; streaming low-RAM sampler | `scripts/test_model_improvements.py` — 34 checks pass; sample run: candidate recall 0.985, macro F0.5 **0.9818** | ✅ **Validated** on a 3,000-S1 sample | Day 3 (Morning) |
+| **M6.5: Model Improvements** | Hard negatives (E4), per-source thresholds (E5), dual models (E6), conservative rules (E7), singleton barrier (E8), phonetic/recall blocking fixes; streaming low-RAM sampler | `scripts/test_model_improvements.py` — 45 checks pass; sample run: candidate recall 0.985, macro F0.5 **0.9818** | ✅ **Validated** on a 3,000-S1 sample | Day 3 (Morning) |
+| **M6.6: Scalable Inference** | Chunked/streaming `--mode predict` (`--chunk-size`, `--limit-s1`); `TargetLookup`; core-column restriction; incremental TSV writers | Real-data bounded smoke run: 1,500 S1 rows + candidates written, 0 superset violations | ✅ **Implemented** | Day 3 (Morning) |
 | **M7: Final Packaging** | Clean code under `code/`, `Documentation_template.md`, ZIP | All constraints, license checks, and ZIP integrity verified | 🔄 **In Progress** | Day 3 |
 
 ---

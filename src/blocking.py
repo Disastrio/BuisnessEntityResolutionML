@@ -21,8 +21,10 @@ PYTHONHASHSEED values) and keeps the highest-precision blocks first.
 from collections import defaultdict
 from itertools import zip_longest
 from typing import Dict, Set, List, Tuple, Optional
+import os
 import re
 import math
+import multiprocessing as mp
 
 import numpy as np
 import pandas as pd
@@ -30,6 +32,7 @@ from tqdm import tqdm
 
 from src.config import (
     MAX_CANDIDATES, ID_COL, USE_PHONETIC_BLOCK, SOUNDEX_LENGTH, BLOCK_FETCH_CAP,
+    USE_TRIGRAM_BLOCK,
 )
 
 
@@ -267,6 +270,7 @@ def build_candidate_indices(
     target_df: pd.DataFrame,
     rare_tokens: Optional[Set[str]] = None,
     rare_addr_tokens: Optional[Set[str]] = None,
+    rare_trigrams: Optional[Set[str]] = None,
 ) -> Dict[str, Dict[str, List[str]]]:
     """
     Build all inverted indices for a target source (S2 or S3).
@@ -399,6 +403,21 @@ def build_candidate_indices(
                         idx8[f"{country}|atok|{tok}"].append(eid)
         indices['addr_rare'] = dict(idx8)
 
+    # Index 9: Distinctive name character trigrams (typo/transliteration recall)
+    if rare_trigrams:
+        print(f"  Building Index 9 (name trigrams, {len(rare_trigrams)} grams)...")
+        idx9 = defaultdict(list)
+        for eid, name, country in zip(
+            target_df[ID_COL], target_df['name_clean'], target_df['country_clean']
+        ):
+            name = str(name).strip()
+            country = str(country).strip()
+            if name:
+                for gram in _trigrams(name):
+                    if gram in rare_trigrams:
+                        idx9[f"{country}|tri|{gram}"].append(eid)
+        indices['trigram'] = dict(idx9)
+
     # Index 7: Relaxed name
     print("  Building Index 7 (relaxed name)...")
     idx7 = defaultdict(list)
@@ -419,6 +438,7 @@ def _ranked_candidates_for_s1(
     indices: Dict[str, Dict[str, List[str]]],
     rare_tokens: Optional[Set[str]] = None,
     rare_addr_tokens: Optional[Set[str]] = None,
+    rare_trigrams: Optional[Set[str]] = None,
     max_candidates: int = MAX_CANDIDATES,
 ) -> List[str]:
     """
@@ -471,6 +491,14 @@ def _ranked_candidates_for_s1(
                 rare_ids.extend(fetch('rare_tokens', f"{country}|rtok|{tok}"))
     block_lists.append(rare_ids)
 
+    # 9: Distinctive name trigrams (typo / transliteration recall)
+    tri_ids: List[str] = []
+    if rare_trigrams and name:
+        for gram in _trigrams(name):
+            if gram in rare_trigrams:
+                tri_ids.extend(fetch('trigram', f"{country}|tri|{gram}"))
+    block_lists.append(tri_ids)
+
     # 6: Phonetic (Soundex) prefix of leading token
     sndx_ids: List[str] = []
     if USE_PHONETIC_BLOCK:
@@ -510,16 +538,41 @@ def _ranked_candidates_for_s1(
     else:
         block_lists.append([])
 
-    # Bound per-block work, then round-robin interleave (dedup across blocks).
+    # Bound per-block work.
     block_lists = [b[:BLOCK_FETCH_CAP] for b in block_lists]
-    ordered: List[str] = []
-    seen: Set[str] = set()
-    max_len = max((len(b) for b in block_lists), default=0)
-    for i in range(max_len):
-        for block in block_lists:
-            if i < len(block):
-                eid = block[i]
-                if eid not in seen:
+
+    # Rank candidates by how many independent blocks retrieved them. A true
+    # match typically co-occurs in several blocks (exact/prefix/postal/rare/
+    # phonetic/numeric), whereas a huge low-precision block contributes a flood
+    # of single-block hits. Sorting by hit count keeps true matches inside the
+    # candidate cap as the target set grows.
+    hits: Dict[str, int] = {}
+    best_rank: Dict[str, int] = {}
+    for bi, block in enumerate(block_lists):
+        for eid in block:
+            hits[eid] = hits.get(eid, 0) + 1
+            if eid not in best_rank:
+                best_rank[eid] = bi
+
+    # 1) Multi-block candidates first: true matches usually co-occur across
+    #    blocks, so this secures them before broad single-block floods.
+    ordered: List[str] = [
+        eid for eid in hits if hits[eid] >= 2
+    ]
+    ordered.sort(key=lambda e: (-hits[e], best_rank[e], e))
+    ordered = ordered[:max_candidates]
+
+    # 2) Fill any remaining slots by round-robin across blocks so a true match
+    #    reached by only ONE (possibly low-priority) block is not starved.
+    if len(ordered) < max_candidates:
+        seen: Set[str] = set(ordered)
+        max_len = max((len(b) for b in block_lists), default=0)
+        for i in range(max_len):
+            for block in block_lists:
+                if i < len(block):
+                    eid = block[i]
+                    if eid in seen or hits[eid] >= 2:
+                        continue
                     seen.add(eid)
                     ordered.append(eid)
                     if len(ordered) >= max_candidates:
@@ -532,13 +585,213 @@ def generate_candidates_for_s1(
     indices: Dict[str, Dict[str, List[str]]],
     rare_tokens: Optional[Set[str]] = None,
     rare_addr_tokens: Optional[Set[str]] = None,
+    rare_trigrams: Optional[Set[str]] = None,
     max_candidates: int = MAX_CANDIDATES,
 ) -> Set[str]:
     """Set-returning wrapper around `_ranked_candidates_for_s1`."""
     return set(_ranked_candidates_for_s1(
         s1_row, indices, rare_tokens=rare_tokens,
-        rare_addr_tokens=rare_addr_tokens, max_candidates=max_candidates,
+        rare_addr_tokens=rare_addr_tokens, rare_trigrams=rare_trigrams,
+        max_candidates=max_candidates,
     ))
+
+
+def _trigrams(text: str, n: int = 3) -> Set[str]:
+    """Character n-grams of a name with whitespace removed."""
+    s = re.sub(r'\s+', '', str(text))
+    if len(s) < n:
+        return {s} if s else set()
+    return {s[i:i + n] for i in range(len(s) - n + 1)}
+
+
+def compute_rare_trigrams(
+    df: pd.DataFrame,
+    col: str = 'name_clean',
+    min_freq: int = 2,
+    max_doc_frac: float = 0.02,
+) -> Set[str]:
+    """
+    Distinctive character trigrams (document frequency in [min_freq, max_frac]).
+
+    Common trigrams ('the', 'ing') are excluded so the inverted index stays
+    small; rare trigrams are highly discriminative and recover name variants
+    (typos, transliterations) that prefix/soundex blocks miss.
+    """
+    doc_freq: Dict[str, int] = defaultdict(int)
+    n_docs = len(df)
+    for name in df[col]:
+        if not name:
+            continue
+        for gram in _trigrams(name):
+            doc_freq[gram] += 1
+    max_count = max(1, int(n_docs * max_doc_frac))
+    return {g for g, f in doc_freq.items() if min_freq <= f <= max_count}
+
+
+def build_all_indices(s2_df: pd.DataFrame, s3_df: pd.DataFrame) -> Dict[str, object]:
+    """
+    Compute distinctive tokens and build every inverted index for S2 and S3 once.
+
+    Returns a bundle that can be reused across many S1 chunks, so streaming
+    inference pays the (expensive) index-build cost a single time instead of
+    per chunk.
+    """
+    print("Computing distinctive tokens for S2...")
+    rare_tokens_s2 = compute_rare_tokens(s2_df, col='name_tokens')
+    rare_addr_s2 = compute_rare_tokens(s2_df, col='addr_clean')
+    rare_tri_s2 = compute_rare_trigrams(s2_df) if USE_TRIGRAM_BLOCK else set()
+    print(f"  S2: {len(rare_tokens_s2)} name tokens, {len(rare_addr_s2)} address "
+          f"tokens, {len(rare_tri_s2)} trigrams")
+
+    print("Computing distinctive tokens for S3...")
+    rare_tokens_s3 = compute_rare_tokens(s3_df, col='name_tokens')
+    rare_addr_s3 = compute_rare_tokens(s3_df, col='addr_clean')
+    rare_tri_s3 = compute_rare_trigrams(s3_df) if USE_TRIGRAM_BLOCK else set()
+    print(f"  S3: {len(rare_tokens_s3)} name tokens, {len(rare_addr_s3)} address "
+          f"tokens, {len(rare_tri_s3)} trigrams")
+
+    print("\nBuilding S2 indices...")
+    s2_indices = build_candidate_indices(
+        s2_df, rare_tokens=rare_tokens_s2, rare_addr_tokens=rare_addr_s2,
+        rare_trigrams=rare_tri_s2)
+
+    print("\nBuilding S3 indices...")
+    s3_indices = build_candidate_indices(
+        s3_df, rare_tokens=rare_tokens_s3, rare_addr_tokens=rare_addr_s3,
+        rare_trigrams=rare_tri_s3)
+
+    return {
+        's2_indices': s2_indices,
+        's3_indices': s3_indices,
+        'rare_tokens_s2': rare_tokens_s2,
+        'rare_tokens_s3': rare_tokens_s3,
+        'rare_addr_s2': rare_addr_s2,
+        'rare_addr_s3': rare_addr_s3,
+        'rare_tri_s2': rare_tri_s2,
+        'rare_tri_s3': rare_tri_s3,
+    }
+
+
+def _merge_ranked_sources(
+    s2_ranked: List[str], s3_ranked: List[str], max_candidates: int,
+) -> Set[str]:
+    """
+    Interleave S2/S3 ranked candidate lists so neither source is starved when the
+    global cap is reached (deterministic; no set-order dependence).
+    """
+    combined: List[str] = []
+    seen: Set[str] = set()
+    for s2_id, s3_id in zip_longest(s2_ranked, s3_ranked):
+        for eid in (s2_id, s3_id):
+            if eid is None or eid in seen:
+                continue
+            seen.add(eid)
+            combined.append(eid)
+            if len(combined) >= max_candidates:
+                return set(combined)
+    return set(combined)
+
+
+# Module-level state for forked blocking workers (populated in the parent).
+_BLOCK_CTX: dict = {}
+
+
+def _block_worker(bounds: Tuple[int, int]) -> Dict[str, Set[str]]:
+    """Build candidates for a contiguous slice of S1 rows."""
+    start, end = bounds
+    s1_df = _BLOCK_CTX['s1_df']
+    bundle = _BLOCK_CTX['bundle']
+    cap = _BLOCK_CTX['cap']
+
+    out: Dict[str, Set[str]] = {}
+    for _, s1_row in s1_df.iloc[start:end].iterrows():
+        s1_id = s1_row[ID_COL]
+        s2_ranked = _ranked_candidates_for_s1(
+            s1_row, bundle['s2_indices'],
+            rare_tokens=bundle['rare_tokens_s2'],
+            rare_addr_tokens=bundle['rare_addr_s2'],
+            rare_trigrams=bundle['rare_tri_s2'],
+            max_candidates=cap,
+        )
+        s3_ranked = _ranked_candidates_for_s1(
+            s1_row, bundle['s3_indices'],
+            rare_tokens=bundle['rare_tokens_s3'],
+            rare_addr_tokens=bundle['rare_addr_s3'],
+            rare_trigrams=bundle['rare_tri_s3'],
+            max_candidates=cap,
+        )
+        out[s1_id] = _merge_ranked_sources(s2_ranked, s3_ranked, cap)
+    return out
+
+
+def _generate_candidates_parallel(
+    s1_df: pd.DataFrame,
+    bundle: Dict[str, object],
+    max_candidates: int,
+    n_workers: int,
+) -> Dict[str, Set[str]]:
+    s1 = s1_df.reset_index(drop=True)
+    n = len(s1)
+    global _BLOCK_CTX
+    _BLOCK_CTX = {'s1_df': s1, 'bundle': bundle, 'cap': max_candidates}
+
+    bounds = np.linspace(0, n, n_workers + 1).astype(int)
+    ranges = [(int(bounds[i]), int(bounds[i + 1]))
+              for i in range(n_workers) if bounds[i] < bounds[i + 1]]
+
+    result: Dict[str, Set[str]] = {}
+    ctx = mp.get_context('fork')
+    with ctx.Pool(processes=len(ranges)) as pool:
+        for part in pool.imap_unordered(_block_worker, ranges):
+            result.update(part)
+    return result
+
+
+def generate_candidates_from_bundle(
+    s1_df: pd.DataFrame,
+    bundle: Dict[str, object],
+    max_candidates: int = MAX_CANDIDATES,
+    show_progress: bool = True,
+    n_workers: int = 1,
+) -> Dict[str, Set[str]]:
+    """
+    Generate candidates for a set of S1 rows using a prebuilt index bundle.
+
+    This is the chunk-friendly entry point: call `build_all_indices` once, then
+    invoke this per S1 chunk during streaming inference. Pass n_workers > 1 to
+    parallelise the per-S1 query loop across processes (fork only).
+    """
+    if n_workers and n_workers > 1 and hasattr(os, 'fork') and len(s1_df) >= 2000:
+        return _generate_candidates_parallel(s1_df, bundle, max_candidates, int(n_workers))
+
+    s2_indices = bundle['s2_indices']
+    s3_indices = bundle['s3_indices']
+
+    all_candidates: Dict[str, Set[str]] = {}
+    iterator = s1_df.iterrows()
+    if show_progress:
+        iterator = tqdm(iterator, total=len(s1_df), desc="Blocking")
+
+    for _, s1_row in iterator:
+        s1_id = s1_row[ID_COL]
+        s2_ranked = _ranked_candidates_for_s1(
+            s1_row, s2_indices,
+            rare_tokens=bundle['rare_tokens_s2'],
+            rare_addr_tokens=bundle['rare_addr_s2'],
+            rare_trigrams=bundle['rare_tri_s2'],
+            max_candidates=max_candidates,
+        )
+        s3_ranked = _ranked_candidates_for_s1(
+            s1_row, s3_indices,
+            rare_tokens=bundle['rare_tokens_s3'],
+            rare_addr_tokens=bundle['rare_addr_s3'],
+            rare_trigrams=bundle['rare_tri_s3'],
+            max_candidates=max_candidates,
+        )
+        all_candidates[s1_id] = _merge_ranked_sources(
+            s2_ranked, s3_ranked, max_candidates)
+
+    return all_candidates
 
 
 def generate_all_candidates(
@@ -547,80 +800,24 @@ def generate_all_candidates(
     s3_df: pd.DataFrame,
     max_candidates: int = MAX_CANDIDATES,
     show_progress: bool = True,
+    n_workers: int = 1,
 ) -> Dict[str, Set[str]]:
     """
     Generate candidate pairs for all S1 entities against S2 and S3.
 
-    Args:
-        s1_df: Normalized S1 DataFrame.
-        s2_df: Normalized S2 DataFrame.
-        s3_df: Normalized S3 DataFrame.
-        max_candidates: Max candidate pairs per S1 entity.
+    Convenience wrapper: builds the indices, then delegates to
+    `generate_candidates_from_bundle`.
 
     Returns:
         Dict: {s1_id: set(candidate_s2_s3_ids)}
     """
-    print("Computing distinctive tokens for S2...")
-    rare_tokens_s2 = compute_rare_tokens(s2_df, col='name_tokens')
-    rare_addr_s2 = compute_rare_tokens(s2_df, col='addr_clean')
-    print(f"  S2: {len(rare_tokens_s2)} name tokens, {len(rare_addr_s2)} address tokens")
-
-    print("Computing distinctive tokens for S3...")
-    rare_tokens_s3 = compute_rare_tokens(s3_df, col='name_tokens')
-    rare_addr_s3 = compute_rare_tokens(s3_df, col='addr_clean')
-    print(f"  S3: {len(rare_tokens_s3)} name tokens, {len(rare_addr_s3)} address tokens")
-
-    print("\nBuilding S2 indices...")
-    s2_indices = build_candidate_indices(
-        s2_df, rare_tokens=rare_tokens_s2, rare_addr_tokens=rare_addr_s2)
-
-    print("\nBuilding S3 indices...")
-    s3_indices = build_candidate_indices(
-        s3_df, rare_tokens=rare_tokens_s3, rare_addr_tokens=rare_addr_s3)
-
-    # Generate candidates for each S1 entity
-    print(f"\nGenerating candidates for {len(s1_df)} S1 entities...")
-    all_candidates: Dict[str, Set[str]] = {}
-
-    iterator = s1_df.iterrows()
-    if show_progress:
-        iterator = tqdm(iterator, total=len(s1_df), desc="Blocking")
-
-    for _, s1_row in iterator:
-        s1_id = s1_row[ID_COL]
-
-        # Ranked candidate lists per source (highest-precision blocks first)
-        s2_ranked = _ranked_candidates_for_s1(
-            s1_row, s2_indices,
-            rare_tokens=rare_tokens_s2,
-            rare_addr_tokens=rare_addr_s2,
-            max_candidates=max_candidates,
-        )
-        s3_ranked = _ranked_candidates_for_s1(
-            s1_row, s3_indices,
-            rare_tokens=rare_tokens_s3,
-            rare_addr_tokens=rare_addr_s3,
-            max_candidates=max_candidates,
-        )
-
-        # Interleave S2/S3 by block rank so neither source is starved when the
-        # global cap is reached (deterministic, no set-order dependence).
-        combined: List[str] = []
-        seen: Set[str] = set()
-        for s2_id, s3_id in zip_longest(s2_ranked, s3_ranked):
-            for eid in (s2_id, s3_id):
-                if eid is None or eid in seen:
-                    continue
-                seen.add(eid)
-                combined.append(eid)
-                if len(combined) >= max_candidates:
-                    break
-            if len(combined) >= max_candidates:
-                break
-
-        all_candidates[s1_id] = set(combined)
-
-    return all_candidates
+    bundle = build_all_indices(s2_df, s3_df)
+    print(f"\nGenerating candidates for {len(s1_df)} S1 entities "
+          f"(workers={n_workers})...")
+    return generate_candidates_from_bundle(
+        s1_df, bundle, max_candidates=max_candidates,
+        show_progress=show_progress, n_workers=n_workers,
+    )
 
 
 # ═════════════════════════════════════════════════════════════════════════════

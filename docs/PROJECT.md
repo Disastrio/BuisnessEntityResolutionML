@@ -9,19 +9,21 @@
 ## 🔴 CURRENT STATUS
 
 ```
-Phase:         MODEL ADVANCED & VALIDATED ON SAMPLE (E4-E8 + blocking recall fixes)
+Phase:         TRAINED ON 32GB VM + FULL TEST INFERENCE IN PROGRESS
 Modules:       src/normalize.py, src/blocking.py, src/features.py, src/train.py,
                src/predict.py, src/evaluate.py, src/pipeline.py (All built & unit tested)
-Measured F0.5: 0.9818 on a streaming aligned 3,000-S1 sample (600 held-out S1 entities),
-               up from 0.9465 on the same sample before the blocking-recall fixes.
-               (The 0.908 E3 figure was never reproduced here — see experiment log.)
+Trained model: 120,000-S1 aligned sample, 29.9M candidate pairs (VM, all phases parallel)
+Measured F0.5: 0.905 (120k) | 0.957 (20k) | 0.982 (3k). Larger samples use a realistic
+               (larger) target pool, so their F0.5 reflects the true blocking-recall
+               ceiling (~0.89 at 120k); the classifier itself is identical and precise (0.96).
 Best Model:    LightGBM pairwise binary classifier with RapidFuzz similarity features
-Next Action:   -> Scale the validated config to the largest sample RAM allows, then run
-               full test inference and the official validator before packaging
+Next Action:   -> Finish full test inference (fast cap=20) and submit matching_results.tsv
 Roadmap:       See ROADMAP.md for phase-by-phase execution plan
 Explainer:     See PROJECT_EXPLAINER.md for intuitive plain-English system guide
-Verification:  python scripts/test_model_improvements.py  (34 synthetic checks, all pass)
+Verification:  python scripts/test_model_improvements.py  (49 checks with fork / 47 on Windows)
 Diagnostics:   python scripts/diagnose_blocking.py [n_s1]  (why true matches are missed)
+Inference:     chunked/streaming predict (--chunk-size / --max-candidates); scales with chunk
+Packaging:     python scripts/make_submission_zip.py --team <name>
 ```
 
 ---
@@ -245,7 +247,11 @@ Why:
 | E7 | **Conservative decision rules** — reject high-name / no-address pairs | ✅ Implemented | auto-declined | `conservative_reject_mask`; correctly rejected (did not beat baseline) |
 | E8 | **Singleton-aware tuning** — empty-prediction confidence barrier | ✅ Implemented | no change | `sweep_singleton_barrier`; baseline already at 1.0 singleton accuracy |
 | E9 | **Phonetic blocking (Index 6)** — Soundex of leading name token | ✅ Implemented | part of E10 | Recovers transliteration variants |
-| E10 | **Recall fixes** — single-numeric index, address-token index, round-robin candidate cap | ✅ Implemented | **0.9818** | Candidate recall 0.879 → 0.986; best single-model config |
+| E10 | **Recall fixes** — single-numeric index, address-token index, round-robin candidate cap | ✅ Implemented | **0.9818** | Candidate recall 0.879 → 0.986 (3k sample) |
+| E11 | **Hit-count candidate ranking + fetch cap 1000** | ✅ Implemented | 0.905 (120k) | Multi-block candidates kept first; candidate recall 0.879 → 0.889 at 120k |
+| E12 | **Full-pipeline parallelism + trigram block** | ✅ Implemented | — | 4-core normalize/blocking/features/sweeps; candidate-trigram index available (disabled until a model is trained with it) |
+| E13 | **Full test inference (streaming)** | 🔄 Running | — | Chunked `--mode predict`, cap 20 for a fast first submission |
+| E14 | **Submission packaging** | ✅ Ready | — | `scripts/make_submission_zip.py`; `Documentation_template.md` filled |
 
 > ✅ = Done and kept | ❌ = Tried and reverted | ⬜ = Not started | 🔄 = In progress
 

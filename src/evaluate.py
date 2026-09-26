@@ -7,6 +7,8 @@ Implements the exact scoring logic for the Amazon ML Challenge:
 - Macro average across all S1 entities
 - Threshold sweep to find optimal decision boundary
 """
+import os
+import multiprocessing as mp
 from typing import Dict, Set, List, Tuple, Optional
 
 import numpy as np
@@ -234,6 +236,42 @@ def assemble_predictions(
     return predictions
 
 
+# ── Parallel sweep helpers (fork): each candidate value is independent ────────
+_SWEEP_CTX: dict = {}
+
+
+def _sweep_worker(value: float):
+    c = _SWEEP_CTX
+    if c['mode'] == 'threshold':
+        threshold = value
+        by_source = None
+        barrier = c.get('barrier', 0.0)
+    else:  # 'barrier'
+        threshold = c.get('threshold')
+        by_source = c.get('by_source')
+        barrier = value
+    preds = assemble_predictions(
+        c['s1_ids'], c['target_ids'], c['probs'],
+        threshold=threshold,
+        thresholds_by_source=by_source,
+        all_s1_ids=c['all_s1'],
+        barrier=barrier,
+        reject_mask=c.get('reject'),
+    )
+    return value, macro_fbeta(c['gt'], preds, c['beta'])
+
+
+def _parallel_sweep(values: List[float], ctx: dict, n_workers: int) -> Dict[float, float]:
+    global _SWEEP_CTX
+    _SWEEP_CTX = ctx
+    scores: Dict[float, float] = {}
+    mpctx = mp.get_context('fork')
+    with mpctx.Pool(processes=int(n_workers)) as pool:
+        for value, score in pool.imap_unordered(_sweep_worker, list(values)):
+            scores[value] = score
+    return scores
+
+
 def threshold_sweep(
     s1_ids: List[str],
     target_ids: List[str],
@@ -243,6 +281,7 @@ def threshold_sweep(
     beta: float = BETA,
     reject_mask: Optional[np.ndarray] = None,
     barrier: float = 0.0,
+    n_workers: int = 1,
 ) -> Tuple[float, float, List[dict]]:
     """
     Sweep a scalar decision threshold to find optimal macro F0.5.
@@ -251,6 +290,7 @@ def threshold_sweep(
         thresholds: List of thresholds to try. Default: 0.30 to 0.95 step 0.01.
         reject_mask: pairs rejected by conservative decision rules.
         barrier: singleton confidence barrier applied at every threshold.
+        n_workers: evaluate independent thresholds across processes (fork only).
 
     Returns:
         (best_threshold, best_score, sweep_results)
@@ -258,6 +298,20 @@ def threshold_sweep(
     if thresholds is None:
         thresholds = [round(t, 2) for t in np.arange(0.30, 0.96, 0.01)]
     thresholds = [float(t) for t in thresholds]
+
+    if n_workers and n_workers > 1 and hasattr(os, 'fork') and len(thresholds) >= 8:
+        ctx = {
+            'mode': 'threshold', 's1_ids': s1_ids, 'target_ids': target_ids,
+            'probs': np.asarray(probabilities), 'all_s1': set(ground_truth.keys()),
+            'barrier': barrier, 'reject': reject_mask,
+            'gt': ground_truth, 'beta': beta,
+        }
+        scores = _parallel_sweep(thresholds, ctx, n_workers)
+        sweep_results = [{'threshold': t, 'macro_fbeta': round(scores[t], 6)}
+                         for t in thresholds]
+        # First max in ascending-threshold order == serial tie-breaking.
+        best_threshold = max(thresholds, key=lambda t: scores[t])
+        return best_threshold, scores[best_threshold], sweep_results
 
     sweep_results = []
     best_threshold = 0.5
@@ -361,6 +415,7 @@ def sweep_singleton_barrier(
     barriers: Optional[List[float]] = None,
     beta: float = BETA,
     reject_mask: Optional[np.ndarray] = None,
+    n_workers: int = 1,
 ) -> Tuple[float, float, List[dict]]:
     """
     Tune the singleton confidence barrier at a fixed threshold.
@@ -368,6 +423,7 @@ def sweep_singleton_barrier(
     The barrier is a second-level gate: an entity only emits matches when its
     best accepted probability clears the barrier. It is a cheap, targeted way to
     protect the ~5.6% singleton entities without hurting confident matches.
+    n_workers parallelises the independent barrier evaluations (fork only).
 
     Returns:
         (best_barrier, best_score, sweep_results)
@@ -375,6 +431,19 @@ def sweep_singleton_barrier(
     if barriers is None:
         barriers = [0.0] + [round(b, 2) for b in np.arange(0.50, 0.99, 0.02)]
     barriers = [float(b) for b in barriers]
+
+    if n_workers and n_workers > 1 and hasattr(os, 'fork') and len(barriers) >= 8:
+        ctx = {
+            'mode': 'barrier', 's1_ids': s1_ids, 'target_ids': target_ids,
+            'probs': np.asarray(probabilities), 'all_s1': set(ground_truth.keys()),
+            'threshold': threshold, 'by_source': thresholds_by_source,
+            'reject': reject_mask, 'gt': ground_truth, 'beta': beta,
+        }
+        scores = _parallel_sweep(barriers, ctx, n_workers)
+        sweep_results = [{'barrier': b, 'macro_fbeta': round(scores[b], 6)}
+                         for b in barriers]
+        best_barrier = max(barriers, key=lambda b: scores[b])
+        return best_barrier, scores[best_barrier], sweep_results
 
     sweep_results = []
     best_barrier = 0.0

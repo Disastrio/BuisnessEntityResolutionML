@@ -31,8 +31,9 @@ import numpy as np
 import pandas as pd
 
 from src.config import (
-    SEED, TRAIN_DIR, TEST_DIR, MODELS_DIR,
-    ID_COL, DEFAULT_THRESH, MAX_CANDIDATES,
+    SEED, MODELS_DIR, ID_COL, DEFAULT_THRESH, MAX_CANDIDATES,
+    MATCHING_OUT, CANDIDATE_OUT,
+    PREDICT_CHUNK_SIZE, PREDICT_LIMIT_S1, FEATURE_WORKERS,
     USE_HARD_NEGATIVES, HARD_NEGATIVE_WEIGHT,
     USE_DUAL_MODELS, USE_SOURCE_THRESHOLDS, USE_CONSERVATIVE_RULES,
     SINGLETON_BARRIER, DEFAULT_MODEL_NAME, DUAL_MODEL_NAME,
@@ -42,7 +43,9 @@ from src.normalize import normalize_all_sources, benchmark_normalization
 from src.blocking import (
     generate_all_candidates, evaluate_blocking,
 )
-from src.features import build_feature_matrix, assign_labels, FEATURE_NAMES
+from src.features import (
+    build_feature_matrix, assign_labels, restrict_to_core_columns,
+)
 from src.train import (
     train_lgbm, split_by_s1_entity,
     save_model, load_model, print_feature_importance,
@@ -54,9 +57,7 @@ from src.evaluate import (
     assemble_predictions, threshold_sweep_by_source, sweep_singleton_barrier,
 )
 from src.predict import (
-    predict_probabilities, assemble_matches, assemble_candidates,
-    save_matching_results, save_candidate_pairs, validate_output,
-    conservative_reject_mask,
+    predict_probabilities, run_chunked_inference, conservative_reject_mask,
 )
 
 
@@ -84,6 +85,7 @@ def run_training(
     use_rules: Optional[bool] = None,
     hard_negatives: Optional[bool] = None,
     barrier: Optional[float] = None,
+    max_candidates: Optional[int] = None,
 ):
     """
     Full training pipeline:
@@ -110,6 +112,7 @@ def run_training(
         USE_HARD_NEGATIVES = hard_negatives
     if barrier is not None:
         SINGLETON_BARRIER = barrier
+    max_candidates = MAX_CANDIDATES if max_candidates is None else int(max_candidates)
 
     total_start = time.time()
 
@@ -136,7 +139,8 @@ def run_training(
     _print_header("Phase 2: Normalizing Records")
     t = time.time()
 
-    s1_norm, s2_norm, s3_norm = normalize_all_sources(s1, s2, s3)
+    s1_norm, s2_norm, s3_norm = normalize_all_sources(
+        s1, s2, s3, n_workers=FEATURE_WORKERS)
 
     # Quick benchmark
     bench = benchmark_normalization(s1)
@@ -149,10 +153,12 @@ def run_training(
     _print_header("Phase 3: Candidate Generation (Blocking)")
     t = time.time()
 
+    print(f"  Max candidates per S1: {max_candidates}")
     candidates = generate_all_candidates(
         s1_norm, s2_norm, s3_norm,
-        max_candidates=MAX_CANDIDATES,
+        max_candidates=max_candidates,
         show_progress=True,
+        n_workers=FEATURE_WORKERS,
     )
 
     # Evaluate blocking quality
@@ -174,10 +180,17 @@ def run_training(
     # Combine S2 and S3 for feature lookup
     target_df = pd.concat([s2_norm, s3_norm], ignore_index=True)
 
+    print(f"  Feature workers: {FEATURE_WORKERS}")
     features, s1_ids, target_ids = build_feature_matrix(
         s1_norm, target_df, candidates, show_progress=True,
+        n_workers=FEATURE_WORKERS,
     )
     labels = assign_labels(s1_ids, target_ids, gt)
+
+    # Halve feature memory; LightGBM trains on float32 natively. The candidate
+    # dict and target frame are no longer needed once features are built.
+    features = features.astype(np.float32)
+    del candidates, target_df
 
     print(f"\n  Feature matrix: {features.shape}")
     print(f"  Positive pairs: {int(labels.sum()):,}")
@@ -199,6 +212,9 @@ def run_training(
     print(f"  Train: {len(X_train):,} pairs ({int(y_train.sum()):,} pos)")
     print(f"  Val:   {len(X_val):,} pairs ({int(y_val.sum()):,} pos)")
     print(f"  Val S1 entities: {len(val_s1_set):,}")
+
+    # The unsplit frames are superseded by the train/val copies.
+    del features, labels, s1_ids, target_ids
 
     # E4: hard-negative upweighting
     weights_train = compute_sample_weights(
@@ -242,9 +258,10 @@ def run_training(
     if USE_CONSERVATIVE_RULES:
         candidate_reject = conservative_reject_mask(X_val)
         _, score_without, _ = threshold_sweep(
-            s1_val, t_val, val_probs, val_gt)
+            s1_val, t_val, val_probs, val_gt, n_workers=FEATURE_WORKERS)
         _, score_with, _ = threshold_sweep(
-            s1_val, t_val, val_probs, val_gt, reject_mask=candidate_reject)
+            s1_val, t_val, val_probs, val_gt, reject_mask=candidate_reject,
+            n_workers=FEATURE_WORKERS)
         if score_with > score_without + 1e-9:
             val_reject = candidate_reject
             use_rules = True
@@ -263,7 +280,8 @@ def run_training(
         print(f"  [E5] Per-source thresholds: {thresholds_by_source}")
     else:
         best_thresh, best_score, sweep = threshold_sweep(
-            s1_val, t_val, val_probs, val_gt, reject_mask=val_reject)
+            s1_val, t_val, val_probs, val_gt, reject_mask=val_reject,
+            n_workers=FEATURE_WORKERS)
     print(f"  Best threshold: {best_thresh}")
     print(f"  Best macro F0.5: {best_score:.6f}")
 
@@ -273,6 +291,7 @@ def run_training(
         threshold=None if thresholds_by_source else best_thresh,
         thresholds_by_source=thresholds_by_source,
         reject_mask=val_reject,
+        n_workers=FEATURE_WORKERS,
     )
     if tuned_barrier > 0:
         print(f"  [E8] Singleton barrier adopted: {tuned_barrier} "
@@ -313,6 +332,7 @@ def run_training(
         'use_conservative_rules': use_rules,
         'use_hard_negatives': USE_HARD_NEGATIVES,
         'dual_model': dual_models is not None,
+        'max_candidates': max_candidates,
         'tuned_macro_f05': best_score,
     }
 
@@ -333,18 +353,29 @@ def run_training(
 # TEST INFERENCE PIPELINE
 # ═════════════════════════════════════════════════════════════════════════════
 
-def run_prediction(threshold: Optional[float] = None):
+def run_prediction(
+    threshold: Optional[float] = None,
+    chunk_size: Optional[int] = None,
+    limit_s1: Optional[int] = None,
+    max_candidates: Optional[int] = None,
+    barrier: Optional[float] = None,
+):
     """
-    Full test inference pipeline:
-    1. Load model and test data
-    2. Normalize test data
-    3. Generate candidates
-    4. Compute features
-    5. Predict and threshold
-    6. Save output files
-    7. Validate
+    Full test inference pipeline (chunked / streaming):
+
+    1. Load the most recently trained model
+    2. Load + normalize test data, keeping only core columns
+    3. Build blocking indices once
+    4. Score S1 in chunks (candidates -> features -> probabilities -> output)
+    5. Stream matching_results.tsv and candidate_pairs.tsv to disk
+    6. Report lightweight integrity checks
+
+    Memory scales with `chunk_size` (not the ~1.7M test S1 entities), so this
+    runs within 16-32 GB instead of the 64-128 GB an all-in-memory pass needs.
     """
     total_start = time.time()
+    chunk_size = chunk_size or PREDICT_CHUNK_SIZE
+    limit_s1 = PREDICT_LIMIT_S1 if limit_s1 is None else limit_s1
 
     # ── Load Model ────────────────────────────────────────────────────────
     _print_header("Loading Model")
@@ -358,120 +389,111 @@ def run_prediction(threshold: Optional[float] = None):
     )
 
     dual_models = None
+    model = None
     if use_dual:
         dual_models, metadata = load_dual_models()
-        model = None
         print(f"  Loaded dual source-specific models: {sorted(dual_models.keys())}")
+
+        def score_fn(feats, tids, _models=dual_models):
+            return predict_dual_probabilities(_models, feats, tids)
     else:
         model, metadata = load_model()
+
+        def score_fn(feats, tids, _model=model):
+            return predict_probabilities(_model, feats)
 
     if threshold is None:
         threshold = metadata.get('best_threshold', DEFAULT_THRESH)
     thresholds_by_source = metadata.get('thresholds_by_source')
-    barrier = metadata.get('barrier', SINGLETON_BARRIER) or 0.0
+    if barrier is None:
+        barrier = metadata.get('barrier', SINGLETON_BARRIER) or 0.0
+    barrier = float(barrier)
     use_rules = metadata.get('use_conservative_rules', USE_CONSERVATIVE_RULES)
+    if max_candidates is None:
+        max_candidates = int(metadata.get('max_candidates', MAX_CANDIDATES))
+    max_candidates = int(max_candidates)
 
     print(f"  Threshold: {threshold}")
+    print(f"  Max candidates per S1: {max_candidates}")
     if thresholds_by_source:
         print(f"  Per-source thresholds: {thresholds_by_source}")
     if barrier:
         print(f"  Singleton barrier: {barrier}")
     if use_rules:
         print("  Conservative decision rules: ON")
+    print(f"  Chunk size: {chunk_size:,} S1 entities")
+    if limit_s1 is not None:
+        print(f"  Limit: first {limit_s1:,} S1 entities")
 
     # ── Load Test Data ────────────────────────────────────────────────────
     _print_header("Loading Test Data")
     t = time.time()
-
     s1 = load_source(1, 'test')
     s2 = load_source(2, 'test')
     s3 = load_source(3, 'test')
-
     print(f"  S1: {len(s1):,} records")
     print(f"  S2: {len(s2):,} records")
     print(f"  S3: {len(s3):,} records")
-    print(f"  ⏱ {_elapsed(t)}")
+    print(f"  {_elapsed(t)}")
 
-    # ── Normalize ─────────────────────────────────────────────────────────
+    # ── Normalize (core columns only) ─────────────────────────────────────
     _print_header("Normalizing Test Data")
     t = time.time()
+    s1_norm, s2_norm, s3_norm = normalize_all_sources(
+        s1, s2, s3, n_workers=FEATURE_WORKERS)
+    del s1, s2, s3
+    s1_norm = restrict_to_core_columns(s1_norm)
+    s2_norm = restrict_to_core_columns(s2_norm)
+    s3_norm = restrict_to_core_columns(s3_norm)
+    print(f"  {_elapsed(t)}")
 
-    s1_norm, s2_norm, s3_norm = normalize_all_sources(s1, s2, s3)
-    print(f"  ⏱ {_elapsed(t)}")
-
-    # ── Block ─────────────────────────────────────────────────────────────
-    _print_header("Candidate Generation (Blocking)")
+    # ── Chunked Streaming Inference ───────────────────────────────────────
+    _print_header("Streaming Inference (chunked)")
     t = time.time()
-
-    candidates = generate_all_candidates(
-        s1_norm, s2_norm, s3_norm,
-        max_candidates=MAX_CANDIDATES,
-    )
-    total_cands = sum(len(c) for c in candidates.values())
-    print(f"  Total candidate pairs: {total_cands:,}")
-    print(f"  ⏱ {_elapsed(t)}")
-
-    # ── Features ──────────────────────────────────────────────────────────
-    _print_header("Computing Features")
-    t = time.time()
-
-    target_df = pd.concat([s2_norm, s3_norm], ignore_index=True)
-    features, s1_ids, target_ids = build_feature_matrix(
-        s1_norm, target_df, candidates,
-    )
-    print(f"  Feature matrix: {features.shape}")
-    print(f"  ⏱ {_elapsed(t)}")
-
-    # ── Predict ───────────────────────────────────────────────────────────
-    _print_header("Predicting")
-    t = time.time()
-
-    if dual_models is not None:
-        probs = predict_dual_probabilities(dual_models, features, target_ids)
-    else:
-        probs = predict_probabilities(model, features)
-    all_s1_ids = set(s1[ID_COL])
-
-    reject_mask = conservative_reject_mask(features) if use_rules else None
-    matches = assemble_matches(
-        s1_ids, target_ids, probs, threshold, all_s1_ids,
+    summary = run_chunked_inference(
+        s1_norm, s2_norm, s3_norm, score_fn,
+        threshold=threshold,
         thresholds_by_source=thresholds_by_source,
         barrier=barrier,
-        reject_mask=reject_mask,
+        use_rules=use_rules,
+        max_candidates=max_candidates,
+        chunk_size=chunk_size,
+        limit_s1=limit_s1,
+        n_workers=FEATURE_WORKERS,
     )
-    all_candidates = assemble_candidates(s1_ids, target_ids, all_s1_ids)
+    print(f"  {_elapsed(t)}")
 
-    print(f"  Threshold: {threshold}")
-    if thresholds_by_source:
-        print(f"  Per-source thresholds: {thresholds_by_source}")
-    if reject_mask is not None:
-        print(f"  Rule-rejected pairs: {int(reject_mask.sum()):,}")
-    print(f"  Entities with matches: {sum(1 for m in matches.values() if m):,}")
-    print(f"  Total matched pairs: {sum(len(m) for m in matches.values()):,}")
-    print(f"  ⏱ {_elapsed(t)}")
+    # ── Summary & Lightweight Validation ──────────────────────────────────
+    _print_header("Prediction Summary")
+    expected = len(s1_norm) if limit_s1 is None else min(limit_s1, len(s1_norm))
+    print(f"  S1 rows written:       {summary['s1_written']:,} (expected {expected:,})")
+    print(f"  Entities with matches: {summary['entities_with_matches']:,}")
+    print(f"  Total matched pairs:   {summary['total_matches']:,}")
+    print(f"  Avg candidates per S1: {summary['avg_candidates_per_s1']}")
+    print(f"  Wrote {MATCHING_OUT}")
+    print(f"  Wrote {CANDIDATE_OUT}")
 
-    # ── Save Output ───────────────────────────────────────────────────────
-    _print_header("Saving Output Files")
+    ok = True
+    if summary['s1_written'] != expected:
+        print(f"  [FAIL] expected {expected:,} rows, wrote {summary['s1_written']:,}")
+        ok = False
+    if summary['superset_violations']:
+        print(f"  [FAIL] {summary['superset_violations']:,} rows have matches "
+              f"missing from candidate_pairs.tsv")
+        ok = False
 
-    save_matching_results(matches)
-    save_candidate_pairs(all_candidates)
-
-    # ── Validate ──────────────────────────────────────────────────────────
-    _print_header("Validating Output")
-
-    test_s1_ids = set(s1[ID_COL])
-    test_s2_ids = set(s2[ID_COL])
-    test_s3_ids = set(s3[ID_COL])
-
-    errors = validate_output(matches, all_candidates, test_s1_ids, test_s2_ids, test_s3_ids)
+    if limit_s1 is None:
+        print("\n  Final gate (run before submitting):")
+        print("    python utils/validate_submission.py "
+              "--matching output/matching_results.tsv "
+              "--candidate output/candidate_pairs.tsv --test-dir dataset/test")
 
     total_elapsed = time.time() - total_start
-    _print_header(f"Prediction Complete — Total time: {_elapsed(total_start)}")
-
-    if not errors:
-        print("  ✅ All checks passed. Ready for submission!")
+    _print_header(f"Prediction Complete - Total time: {_elapsed(total_start)}")
+    if ok:
+        print("  Streaming integrity checks passed.")
     else:
-        print(f"  ❌ {len(errors)} validation errors — fix before submitting.")
+        print("  Integrity checks FAILED - review before submitting.")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -515,6 +537,18 @@ def main():
         '--barrier', type=float, default=None,
         help='E8: singleton confidence barrier floor (tuned upward)'
     )
+    parser.add_argument(
+        '--max-candidates', type=int, default=None,
+        help='Train: max candidate pairs retained per S1 (blocking recall vs cost)'
+    )
+    parser.add_argument(
+        '--chunk-size', type=int, default=None,
+        help='Predict: S1 entities scored per streaming chunk (default 20000)'
+    )
+    parser.add_argument(
+        '--limit-s1', type=int, default=None,
+        help='Predict: score only the first N S1 entities (smoke / staged runs)'
+    )
     args = parser.parse_args()
 
     train_kwargs = dict(
@@ -523,6 +557,7 @@ def main():
         use_rules=(False if args.no_rules else None),
         hard_negatives=(False if args.no_hard_negatives else None),
         barrier=args.barrier,
+        max_candidates=args.max_candidates,
     )
 
     if args.mode == 'smoke':
@@ -539,7 +574,13 @@ def main():
 
     elif args.mode == 'predict':
         print("[PREDICT] Prediction Mode")
-        run_prediction(threshold=args.threshold)
+        run_prediction(
+            threshold=args.threshold,
+            chunk_size=args.chunk_size,
+            limit_s1=args.limit_s1,
+            max_candidates=args.max_candidates,
+            barrier=args.barrier,
+        )
 
 
 if __name__ == '__main__':
