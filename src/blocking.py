@@ -294,7 +294,8 @@ def build_candidate_indices(
 
     idx = {name: defaultdict(list) for name in (
         'exact_name', 'name_prefix', 'postal', 'rare_tokens', 'addr_numerics',
-        'soundex', 'num_single', 'addr_rare', 'trigram', 'relaxed_name')}
+        'soundex', 'num_single', 'addr_rare', 'trigram', 'relaxed_name',
+        'tokenset', 'postal3')}
 
     ids = target_df[ID_COL].to_numpy()
     names = target_df['name_clean'].to_numpy()
@@ -327,6 +328,11 @@ def build_candidate_indices(
                 for gram in _trigrams(name):
                     if gram in rare_trigrams:
                         idx['trigram'][f"{country}|tri|{gram}"].append(eid)
+            # Token-set key: sorted unique name tokens (word-order invariant).
+            ts = str(tokens_col[i]).strip()
+            if ts:
+                idx['tokenset'][
+                    f"{country}|tset|{'_'.join(sorted(ts.split()))}"].append(eid)
         if use_rt:
             ts = str(tokens_col[i]).strip()
             if ts:
@@ -339,6 +345,8 @@ def build_candidate_indices(
                 code = code.strip()
                 if code:
                     idx['postal'][f"{country}|post|{code}"].append(eid)
+                    if len(code) >= 3:
+                        idx['postal3'][f"{country}|post3|{code[:3]}"].append(eid)
         nums = str(numerics[i]).strip()
         if nums:
             numset = set(nums.split())
@@ -458,8 +466,16 @@ def _candidates_from_components(comp: dict, indices, rare_tokens,
     for code in comp['postals']:
         post.extend(fetch('postal', f"{country}|post|{code}"))
     block_lists.append(post)
+    post3: List[str] = []
+    for code in comp['postals']:
+        if len(code) >= 3:
+            post3.extend(fetch('postal3', f"{country}|post3|{code[:3]}"))
+    block_lists.append(post3)
     block_lists.append(
         fetch('name_prefix', f"{country}|pfx|{cname[:6]}") if len(cname) >= 3 else [])
+    block_lists.append(
+        fetch('tokenset', f"{country}|tset|{'_'.join(sorted(comp['tokens']))}")
+        if comp['tokens'] else [])
     if rare_tokens:
         rare: List[str] = []
         for tok in comp['tokens']:

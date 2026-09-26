@@ -20,7 +20,9 @@ from src.config import (
     NAME_VERY_HIGH_THRESHOLD, ADDR_WEAK_THRESHOLD,
 )
 from src.features import FEATURE_NAMES, build_feature_matrix, TargetLookup
-from src.evaluate import assemble_predictions, infer_source
+from src.evaluate import (
+    assemble_predictions, infer_source, dynamic_threshold_array,
+)
 from src.blocking import build_all_indices, generate_candidates_from_bundle
 
 
@@ -100,6 +102,7 @@ def assemble_matches(
     thresholds_by_source: Optional[Dict[str, float]] = None,
     barrier: float = 0.0,
     reject_mask: Optional[np.ndarray] = None,
+    pair_thresholds: Optional[np.ndarray] = None,
 ) -> Dict[str, Set[str]]:
     """
     Assemble per-S1 entity matches by applying threshold(s) and guards.
@@ -124,6 +127,7 @@ def assemble_matches(
         all_s1_ids=all_s1_ids,
         barrier=barrier,
         reject_mask=reject_mask,
+        pair_thresholds=pair_thresholds,
     )
 
 
@@ -254,6 +258,8 @@ def run_chunked_inference(
     limit_s1: Optional[int] = None,
     n_workers: int = 1,
     resume: bool = False,
+    competitive: bool = False,
+    tiered: bool = False,
     show_progress: bool = True,
 ) -> dict:
     """
@@ -275,9 +281,9 @@ def run_chunked_inference(
     Returns:
         Summary dict with counts and lightweight integrity checks.
     """
-    from tqdm import tqdm
-
     import os
+    import tempfile
+    from tqdm import tqdm
 
     s1 = s1_df.reset_index(drop=True)
     if limit_s1 is not None:
@@ -313,14 +319,23 @@ def run_chunked_inference(
     total_matches = 0
     total_candidates = 0
     superset_violations = 0
+    all_s1_order = s1[ID_COL].tolist()
+
+    # Competitive mode buffers above-threshold pairs, then assigns each target to
+    # its single best S1 (enforces the injective target->S1 mapping).
+    acc_f = None
+    acc_path = None
+    if competitive:
+        fd, acc_path = tempfile.mkstemp(prefix="er_accept_", suffix=".tsv")
+        acc_f = os.fdopen(fd, "w", encoding="utf-8", newline="")
 
     starts = list(range(0, len(s1), chunk_size))
-    iterator = starts
-    if show_progress:
-        iterator = tqdm(starts, desc="Inference chunks")
+    iterator = tqdm(starts, desc="Inference chunks") if show_progress else starts
 
-    with TsvListWriter(matching_path, GT_MATCH_COL, append=append) as mw, \
-            TsvListWriter(candidate_path, CAND_MATCH_COL, append=append) as cw:
+    mw = None if competitive else TsvListWriter(
+        matching_path, GT_MATCH_COL, append=append)
+    cw = TsvListWriter(candidate_path, CAND_MATCH_COL, append=append)
+    try:
         for start in iterator:
             chunk = s1.iloc[start:start + chunk_size]
             chunk_ids = set(chunk[ID_COL])
@@ -328,44 +343,92 @@ def run_chunked_inference(
             candidates = generate_candidates_from_bundle(
                 chunk, bundle, max_candidates=max_candidates,
                 show_progress=False, n_workers=n_workers)
-
             features, s1_ids, target_ids = build_feature_matrix(
                 chunk, target_df, candidates,
-                show_progress=False, target_lookup=lookup, n_workers=n_workers,
-            )
+                show_progress=False, target_lookup=lookup, n_workers=n_workers)
 
             if len(features) > 0:
                 features = features.astype(np.float32, copy=False)
                 probs = np.asarray(score_fn(features, target_ids), dtype=np.float64)
-                reject_mask = (conservative_reject_mask(features)
-                               if use_rules else None)
+                reject = conservative_reject_mask(features) if use_rules else None
+                thr = dynamic_threshold_array(features) if tiered else None
             else:
                 probs = np.array([], dtype=np.float64)
-                reject_mask = None
+                reject = None
+                thr = None
 
-            matches = assemble_matches(
-                s1_ids, target_ids, probs, threshold, chunk_ids,
-                thresholds_by_source=thresholds_by_source,
-                barrier=barrier,
-                reject_mask=reject_mask,
-            )
             cand_lists = assemble_candidates(s1_ids, target_ids, chunk_ids)
 
+            if competitive:
+                if len(features) > 0:
+                    for i in range(len(s1_ids)):
+                        if reject is not None and bool(reject[i]):
+                            continue
+                        p = probs[i]
+                        t = float(thr[i]) if thr is not None else float(threshold)
+                        if p >= t:
+                            acc_f.write(f"{s1_ids[i]}\t{target_ids[i]}\t{p:.6f}\n")
+            else:
+                matches = assemble_matches(
+                    s1_ids, target_ids, probs, threshold, chunk_ids,
+                    thresholds_by_source=thresholds_by_source,
+                    barrier=barrier, reject_mask=reject, pair_thresholds=thr)
+
             for s1_id in sorted(chunk_ids):
-                m = matches.get(s1_id, set())
                 c = cand_lists.get(s1_id, set())
-                if not m <= c:
-                    superset_violations += 1
-                mw.write(s1_id, m)
+                total_candidates += len(c)
                 cw.write(s1_id, c)
+                if not competitive:
+                    m = matches.get(s1_id, set())
+                    if not m <= c:
+                        superset_violations += 1
+                    mw.write(s1_id, m)
+                    total_s1 += 1
+                    total_matches += len(m)
+                    if m:
+                        entities_with_matches += 1
+
+            del candidates, features, cand_lists, probs, target_ids, s1_ids
+
+    finally:
+        if mw is not None:
+            mw.close()
+        cw.close()
+
+    if competitive:
+        acc_f.close()
+        # Pass 2: each target goes to its single highest-probability S1.
+        best: Dict[str, tuple] = {}
+        with open(acc_path, "r", encoding="utf-8") as f:
+            for line in f:
+                s1_id, t_id, p = line.rstrip("\n").split("\t")
+                p = float(p)
+                cur = best.get(t_id)
+                if cur is None or p > cur[1]:
+                    best[t_id] = (s1_id, p)
+        owned: Dict[str, Set[str]] = {}
+        best_prob: Dict[str, float] = {}
+        for t_id, (s1_id, p) in best.items():
+            owned.setdefault(s1_id, set()).add(t_id)
+            if p > best_prob.get(s1_id, 0.0):
+                best_prob[s1_id] = p
+        if barrier and barrier > 0.0:
+            for s1_id in list(owned):
+                if best_prob.get(s1_id, 0.0) < barrier:
+                    owned[s1_id] = set()
+
+        with TsvListWriter(matching_path, GT_MATCH_COL, append=append) as mw2:
+            for s1_id in all_s1_order:
+                m = owned.get(s1_id, set())
+                mw2.write(s1_id, m)
                 total_s1 += 1
                 total_matches += len(m)
-                total_candidates += len(c)
                 if m:
                     entities_with_matches += 1
-
-            # Release this chunk's memory before the next one.
-            del candidates, features, matches, cand_lists, probs, target_ids, s1_ids
+        try:
+            os.remove(acc_path)
+        except OSError:
+            pass
 
     return {
         's1_written': total_s1,

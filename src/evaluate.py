@@ -12,7 +12,9 @@ import multiprocessing as mp
 from typing import Dict, Set, List, Tuple, Optional
 
 import numpy as np
-from src.config import BETA
+from src.config import (
+    BETA, TIER_HIGH_EVIDENCE, TIER_STANDARD, TIER_DANGEROUS,
+)
 
 
 def infer_source(entity_id: str) -> str:
@@ -39,6 +41,32 @@ def _resolve_threshold(target_id: str, threshold: Optional[float],
             threshold if threshold is not None else 0.5,
         )
     return threshold if threshold is not None else 0.5
+
+
+def dynamic_threshold_array(features, t_high: Optional[float] = None,
+                            t_std: Optional[float] = None,
+                            t_dang: Optional[float] = None) -> np.ndarray:
+    """
+    Per-pair decision thresholds (tiered) from candidate features:
+      Tier 1 (exact name + numeric/postal confirmation) -> lenient `t_high`
+      Tier 2 (standard)                                 -> `t_std`
+      Tier 3 (high name similarity, no address proof)   -> strict `t_dang`
+    Returns an array aligned with `features` rows.
+    """
+    t_high = TIER_HIGH_EVIDENCE if t_high is None else t_high
+    t_std = TIER_STANDARD if t_std is None else t_std
+    t_dang = TIER_DANGEROUS if t_dang is None else t_dang
+
+    name_lev = features['name_levenshtein'].to_numpy()
+    name_exact = features['name_exact_match'].to_numpy()
+    addr_num = features['addr_numeric_overlap'].to_numpy()
+    addr_post = features['addr_postal_match'].to_numpy()
+    addr_tok = features['addr_token_jaccard'].to_numpy()
+
+    thr = np.full(len(features), float(t_std), dtype=np.float64)
+    thr[(name_exact >= 1.0) & ((addr_num >= 1.0) | (addr_post >= 0.5))] = float(t_high)
+    thr[(name_lev > 0.90) & (addr_tok < 0.30) & (addr_post < 0.5)] = float(t_dang)
+    return thr
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -195,6 +223,7 @@ def assemble_predictions(
     all_s1_ids: Optional[Set[str]] = None,
     barrier: float = 0.0,
     reject_mask: Optional[np.ndarray] = None,
+    pair_thresholds: Optional[np.ndarray] = None,
 ) -> Dict[str, Set[str]]:
     """
     Core per-S1 prediction assembler shared by tuning and inference.
@@ -222,7 +251,10 @@ def assemble_predictions(
         if reject_mask is not None and bool(reject_mask[i]):
             continue
         prob = float(probs_arr[i])
-        if prob < _resolve_threshold(t_id, threshold, thresholds_by_source):
+        if pair_thresholds is not None:
+            if prob < float(pair_thresholds[i]):
+                continue
+        elif prob < _resolve_threshold(t_id, threshold, thresholds_by_source):
             continue
         predictions.setdefault(s1_id, set()).add(t_id)
         if prob > best_prob.get(s1_id, -1.0):

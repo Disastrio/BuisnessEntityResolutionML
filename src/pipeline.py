@@ -410,6 +410,8 @@ def run_prediction(
     barrier: Optional[float] = None,
     workers: Optional[int] = None,
     resume: bool = False,
+    competitive: bool = False,
+    tiered: bool = False,
 ):
     """
     Full test inference pipeline (chunked / streaming):
@@ -516,6 +518,8 @@ def run_prediction(
         limit_s1=limit_s1,
         n_workers=FEATURE_WORKERS,
         resume=resume,
+        competitive=competitive,
+        tiered=tiered,
     )
     print(f"  {_elapsed(t)}")
 
@@ -629,6 +633,16 @@ def main():
         help='Train: always apply conservative rules (reject high-name / '
              'no-address risky pairs)'
     )
+    parser.add_argument(
+        '--competitive', action='store_true',
+        help='Predict: enforce target injectivity (each S2/S3 target assigned '
+             'to its single best S1) — removes guaranteed false merges'
+    )
+    parser.add_argument(
+        '--tiered', action='store_true',
+        help='Predict: dynamic tiered per-pair thresholds (lenient on exact '
+             'name + address; strict on high-name / no-address)'
+    )
     args = parser.parse_args()
 
     train_kwargs = dict(
@@ -666,6 +680,8 @@ def main():
             barrier=args.barrier,
             workers=args.workers,
             resume=args.resume,
+            competitive=args.competitive,
+            tiered=args.tiered,
         )
 
 

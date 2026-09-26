@@ -729,6 +729,61 @@ def test_precision_targeting():
           f"t={t} P={chosen['pair_precision']} F={score}")
 
 
+def test_dynamic_thresholds():
+    print("\n[16] Dynamic tiered thresholds")
+    from src.evaluate import dynamic_threshold_array
+    from src.config import TIER_HIGH_EVIDENCE, TIER_STANDARD, TIER_DANGEROUS
+    feats = make_features([
+        {"name_exact_match": 1.0, "addr_numeric_overlap": 1.0, "name_levenshtein": 1.0},
+        {"name_levenshtein": 0.95, "addr_token_jaccard": 0.10, "addr_postal_match": 0.0},
+        {"name_levenshtein": 0.80, "addr_token_jaccard": 0.50, "addr_postal_match": 0.0},
+    ])
+    thr = dynamic_threshold_array(feats)
+    check("tier1 lenient", thr[0] == TIER_HIGH_EVIDENCE, f"{thr[0]}")
+    check("tier3 strict", thr[1] == TIER_DANGEROUS, f"{thr[1]}")
+    check("standard tier", thr[2] == TIER_STANDARD, f"{thr[2]}")
+
+
+def test_competitive_assignment():
+    print("\n[17] Injectivity: competitive target assignment")
+    s1 = restrict_to_core_columns(normalize_dataframe(pd.DataFrame([
+        raw("acme corp", "1 main st 11111", "US"),
+        raw("acme corp", "9 other rd 22222", "US"),
+    ]).assign(entity_id=["S1-1", "S1-2"]), "S1"))
+    s2 = restrict_to_core_columns(normalize_dataframe(pd.DataFrame([
+        raw("acme corp", "1 main st 11111", "US"),
+    ]).assign(entity_id=["S2-1"]), "S2"))
+    s3 = restrict_to_core_columns(normalize_dataframe(pd.DataFrame([
+        raw("zzz nothing", "8 nowhere 33333", "US"),
+    ]).assign(entity_id=["S3-1"]), "S3"))
+
+    def score_fn(feats, tids):
+        return np.where(feats["addr_exact_match"].to_numpy() > 0.5, 0.95, 0.80)
+
+    def run(competitive, tmp):
+        mpath = Path(tmp) / f"m_{competitive}.tsv"
+        cpath = Path(tmp) / f"c_{competitive}.tsv"
+        run_chunked_inference(
+            s1, s2, s3, score_fn, threshold=0.7, use_rules=False, chunk_size=1,
+            matching_path=mpath, candidate_path=cpath, show_progress=False,
+            competitive=competitive)
+        d = {}
+        for ln in mpath.read_text(encoding="utf-8").splitlines()[1:]:
+            k, v = ln.split("\t")
+            d[k] = v
+        return d
+
+    with tempfile.TemporaryDirectory() as tmp:
+        plain = run(False, tmp)
+        comp = run(True, tmp)
+        # Without assignment, target S2-1 is claimed by both S1 (false merge).
+        check("non-competitive allows duplicate target",
+              plain["S1-1"] == "S2-1" and plain["S1-2"] == "S2-1", f"{plain}")
+        # Competitive assigns S2-1 only to its best S1.
+        check("competitive enforces injectivity",
+              comp["S1-1"] == "S2-1" and comp["S1-2"] == "", f"{comp}")
+
+
 def main():
     print("=" * 70)
     print("  Model Improvement Verification (E4-E8 + Index 6)")
@@ -748,6 +803,8 @@ def main():
     test_normalize_equivalence()
     test_normalization_fixes()
     test_precision_targeting()
+    test_dynamic_thresholds()
+    test_competitive_assignment()
 
     print("\n" + "=" * 70)
     print(f"  RESULT: {_PASS} passed, {_FAIL} failed")

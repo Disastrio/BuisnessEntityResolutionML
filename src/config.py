@@ -61,7 +61,7 @@ METRIC         = "macro_f0_5"
 BETA           = 0.5                     # Precision weight in F-beta
 DEFAULT_THRESH = 0.70                    # Conservative starting threshold for F0.5
 MAX_CANDIDATES = 100                     # Max candidate pairs to retain per S1 record
-BLOCK_FETCH_CAP = 1000                   # Max IDs pulled per block per S1 (bounds work)
+BLOCK_FETCH_CAP = 2000                   # Max IDs retrieved per block per S1 (recall vs work)
 MAX_BUCKET_IDS  = 10_000                 # Drop blocking keys larger than this (super-key bloat)
 
 # ── Streaming Inference ───────────────────────────────────────────────────────
@@ -103,7 +103,7 @@ ADDR_WEAK_THRESHOLD = 0.30               # "no usable address evidence" cutoff
 # true matches (same name/different address, same address/different name, chain
 # branches). These are upweighted during training to sharpen the precision guard.
 USE_HARD_NEGATIVES      = True
-HARD_NEGATIVE_WEIGHT    = 3.0            # sample weight applied to hard negatives
+HARD_NEGATIVE_WEIGHT    = 4.0            # sample weight applied to hard negatives
 
 # E5 - Source-aware thresholds: S2 and S3 have different noise profiles, so the
 # F0.5-optimal decision threshold can differ per source. Learned on validation.
@@ -122,7 +122,15 @@ RULE_THRESHOLD_BOOST    = 0.10           # extra confidence required for risky p
 # E8 - Singleton-aware confidence barrier: an S1 entity emits matches only if its
 # single best candidate probability reaches `barrier`. 0.0 disables the guard.
 # Activating it protects singletons (empty => 1.0; one weak FP => 0.0).
-SINGLETON_BARRIER       = 0.80
+SINGLETON_BARRIER       = 0.85
+
+# Dynamic tiered thresholds (applied per pair at inference when --tiered).
+# Tier 1: exact name + numeric/postal confirmation -> lenient.
+# Tier 2: standard.
+# Tier 3: high name similarity but no address confirmation -> strict/reject.
+TIER_HIGH_EVIDENCE      = 0.60
+TIER_STANDARD           = 0.90
+TIER_DANGEROUS          = 0.96
 
 # Blocking: phonetic (Soundex) index (Index 6) - transliteration / typo recovery.
 USE_PHONETIC_BLOCK      = True

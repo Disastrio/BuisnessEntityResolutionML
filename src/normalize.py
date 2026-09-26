@@ -106,6 +106,14 @@ ADDRESS_ABBREVS = [
     (r'\bblog\s*\.?\b', 'block'),
     (r'\bbk\s*\.?\b', 'block'),
     (r'\bboul\s*\.?\b', 'boulevard'),
+    # French street types (accents already folded by NFKD)
+    (r'\bav\s*\.?\b', 'avenue'),
+    (r'\bbd\s*\.?\b', 'boulevard'),
+    (r'\brue\b', 'rue'),
+    (r'\ballee\b', 'allee'),
+    (r'\bchemin\b', 'chemin'),
+    (r'\bimpasse\b', 'impasse'),
+    (r'\bquai\b', 'quai'),
 ]
 
 # ── Postal Code Patterns ─────────────────────────────────────────────────────
