@@ -68,9 +68,22 @@ PREDICT_CHUNK_SIZE = 20_000              # S1 entities scored per streaming chun
 PREDICT_LIMIT_S1   = None                # score only first N S1 (None = all)
 
 # ── Parallelism ───────────────────────────────────────────────────────────────
-# Worker processes for the per-pair feature loop (>1 uses fork on Linux/macOS;
-# Windows automatically falls back to serial).
-FEATURE_WORKERS    = max(1, (os.cpu_count() or 1))
+# Worker processes for normalize / blocking / feature / sweep pools. Defaults to
+# the CPU count; override with the ER_WORKERS env var or the --workers CLI flag
+# (use a lower number than cores if RAM is tight — forked workers copy touched
+# pages, so memory grows with worker count).
+def _default_workers() -> int:
+    env = os.environ.get('ER_WORKERS')
+    if env:
+        try:
+            return max(1, int(env))
+        except ValueError:
+            pass
+    return max(1, (os.cpu_count() or 1))
+
+
+WORKERS            = _default_workers()
+FEATURE_WORKERS    = WORKERS   # backward-compatible alias
 
 # ── Model Improvement Hyperparameters (Experiments E4-E8) ─────────────────────
 # Thresholds used to recognise boundary cases.

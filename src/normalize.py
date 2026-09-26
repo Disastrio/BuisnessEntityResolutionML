@@ -14,6 +14,7 @@ import os
 import re
 import unicodedata
 import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor
 from typing import Tuple, Optional
 
 import numpy as np
@@ -290,8 +291,16 @@ def normalize_dataframe(df: pd.DataFrame, source_label: str = "") -> pd.DataFram
 _NORM_CTX: dict = {}
 
 
-def _normalize_worker(label: str) -> pd.DataFrame:
-    return normalize_dataframe(_NORM_CTX[label], source_label=label)
+def _normalize_chunk(task):
+    label, start, end = task
+    chunk = _NORM_CTX[label].iloc[start:end]
+    return label, start, normalize_dataframe(chunk, source_label=label)
+
+
+def _normalize_chunk_spawn(task):
+    """Windows path: the chunk is passed in (spawn has no inherited globals)."""
+    label, chunk = task
+    return label, normalize_dataframe(chunk, source_label=label)
 
 
 def normalize_all_sources(
@@ -303,16 +312,51 @@ def normalize_all_sources(
     """
     Normalize all three source DataFrames, tagging each with source label.
 
-    With n_workers > 1 (fork only), S1/S2/S3 are normalized concurrently in
-    separate processes so the three independent sources use multiple cores.
+    With n_workers > 1 (fork only), each source is split into chunks and
+    normalized across a process pool sized to `n_workers`, so normalization
+    scales with CPU cores (previously fixed at 3, one process per source).
+    Results are reassembled in original row order.
     """
+    per = max(1, int(n_workers) // 3) if n_workers else 1
+
     if n_workers and n_workers > 1 and hasattr(os, 'fork'):
         global _NORM_CTX
         _NORM_CTX = {'S1': s1, 'S2': s2, 'S3': s3}
-        ctx = mp.get_context('fork')
-        with ctx.Pool(processes=3) as pool:
-            s1_norm, s2_norm, s3_norm = pool.map(_normalize_worker, ['S1', 'S2', 'S3'])
-        return s1_norm, s2_norm, s3_norm
+        tasks = []
+        for label, df in (('S1', s1), ('S2', s2), ('S3', s3)):
+            n = len(df)
+            if n == 0:
+                continue
+            bounds = np.linspace(0, n, min(per, n) + 1).astype(int)
+            for i in range(len(bounds) - 1):
+                tasks.append((label, int(bounds[i]), int(bounds[i + 1])))
+        parts = {'S1': [], 'S2': [], 'S3': []}
+        with mp.get_context('fork').Pool(
+                processes=min(int(n_workers), len(tasks))) as pool:
+            for label, start, out in pool.imap_unordered(_normalize_chunk, tasks):
+                parts[label].append((start, out))
+        return tuple(
+            pd.concat([df for _, df in sorted(parts[l], key=lambda t: t[0])],
+                      ignore_index=True) if parts[l] else pd.DataFrame()
+            for l in ('S1', 'S2', 'S3'))
+
+    if n_workers and n_workers > 1:   # Windows/spawn: pass chunks explicitly
+        tasks = []
+        for label, df in (('S1', s1), ('S2', s2), ('S3', s3)):
+            n = len(df)
+            if n == 0:
+                continue
+            bounds = np.linspace(0, n, min(per, n) + 1).astype(int)
+            for i in range(len(bounds) - 1):
+                tasks.append((label, df.iloc[int(bounds[i]):int(bounds[i + 1])]))
+        parts = {'S1': [], 'S2': [], 'S3': []}
+        with ProcessPoolExecutor(
+                max_workers=min(int(n_workers), len(tasks))) as ex:
+            for label, out in ex.map(_normalize_chunk_spawn, tasks):
+                parts[label].append(out)
+        return tuple(
+            pd.concat(parts[l], ignore_index=True) if parts[l] else pd.DataFrame()
+            for l in ('S1', 'S2', 'S3'))
 
     s1_norm = normalize_dataframe(s1, source_label='S1')
     s2_norm = normalize_dataframe(s2, source_label='S2')

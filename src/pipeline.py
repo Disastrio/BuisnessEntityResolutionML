@@ -86,6 +86,7 @@ def run_training(
     hard_negatives: Optional[bool] = None,
     barrier: Optional[float] = None,
     max_candidates: Optional[int] = None,
+    workers: Optional[int] = None,
 ):
     """
     Full training pipeline:
@@ -101,7 +102,9 @@ def run_training(
     run (used by the CLI flags).
     """
     global USE_DUAL_MODELS, USE_SOURCE_THRESHOLDS, USE_CONSERVATIVE_RULES
-    global USE_HARD_NEGATIVES, SINGLETON_BARRIER
+    global USE_HARD_NEGATIVES, SINGLETON_BARRIER, FEATURE_WORKERS
+    if workers is not None:
+        FEATURE_WORKERS = max(1, int(workers))
     if dual_model is not None:
         USE_DUAL_MODELS = dual_model
     if source_thresholds is not None:
@@ -359,6 +362,7 @@ def run_prediction(
     limit_s1: Optional[int] = None,
     max_candidates: Optional[int] = None,
     barrier: Optional[float] = None,
+    workers: Optional[int] = None,
 ):
     """
     Full test inference pipeline (chunked / streaming):
@@ -373,6 +377,10 @@ def run_prediction(
     Memory scales with `chunk_size` (not the ~1.7M test S1 entities), so this
     runs within 16-32 GB instead of the 64-128 GB an all-in-memory pass needs.
     """
+    global FEATURE_WORKERS
+    if workers is not None:
+        FEATURE_WORKERS = max(1, int(workers))
+
     total_start = time.time()
     chunk_size = chunk_size or PREDICT_CHUNK_SIZE
     limit_s1 = PREDICT_LIMIT_S1 if limit_s1 is None else limit_s1
@@ -549,6 +557,11 @@ def main():
         '--limit-s1', type=int, default=None,
         help='Predict: score only the first N S1 entities (smoke / staged runs)'
     )
+    parser.add_argument(
+        '--workers', type=int, default=None,
+        help='Process pool size for normalize/blocking/features/sweeps '
+             '(default: CPU count; lower it if RAM is tight)'
+    )
     args = parser.parse_args()
 
     train_kwargs = dict(
@@ -558,6 +571,7 @@ def main():
         hard_negatives=(False if args.no_hard_negatives else None),
         barrier=args.barrier,
         max_candidates=args.max_candidates,
+        workers=args.workers,
     )
 
     if args.mode == 'smoke':
@@ -580,6 +594,7 @@ def main():
             limit_s1=args.limit_s1,
             max_candidates=args.max_candidates,
             barrier=args.barrier,
+            workers=args.workers,
         )
 
 

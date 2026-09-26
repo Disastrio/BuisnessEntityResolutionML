@@ -216,6 +216,33 @@ The model improvements are opt-in so the validated E3 baseline stays reproducibl
 | `--dual-model` | E6 | Train separate `S1↔S2` and `S1↔S3` LightGBM models |
 | `--no-rules` | E7 | Disable the conservative high-name/no-address rejection rule |
 | `--barrier <p>` | E8 | Singleton confidence-barrier floor (tuned upward on validation) |
+| `--workers N` | — | Process pool size for normalize/blocking/features/sweeps (default: CPU count) |
+
+### Running on multi-core local hardware
+The pipeline scales process pools to the CPU count (`ER_WORKERS` env or `--workers`
+override). Each forked worker copies pages it touches, so **memory grows with worker
+count** — on a 16-core / 32 GB box, keep the training sample bounded:
+
+```bash
+# 16 cores, 32 GB: safe training run
+python -m src.pipeline --mode train --sample 200000 --max-candidates 250 --workers 16
+
+# if RAM gets tight (fork copy-on-write), reduce workers
+python -m src.pipeline --mode train --sample 200000 --max-candidates 250 --workers 8
+```
+
+| Workload | Heavy phase | Speedup with more cores | Memory driver |
+|---|---|---|---|
+| Training (sampled) | feature scoring + LightGBM | ~linear to cores | sample size × candidates |
+| Full test inference | index build (single-core) + candidate gen + features | partial (index build unchanged) | S2/S3 frames + candidate cap |
+
+**Cross-platform parallelism:** Linux/macOS use `fork` pools (shared memory). Native
+**Windows uses `spawn`**: each worker re-loads the (small) value arrays, so worker
+memory is `workers × target-array size`. For a sampled **training** run that is fine
+(keep `--workers ≤ 12` on 32 GB). For **full-test inference** on Windows the target
+arrays are ~10 M rows, so use `--workers 1` (or run under WSL2) to avoid per-worker
+duplication. Normalization and feature scoring are parallel on Windows; candidate
+generation and threshold sweeps stay serial there (IPC-volume / already fast).
 
 ```bash
 # Full model: hard negatives + per-source thresholds + rules + dual models

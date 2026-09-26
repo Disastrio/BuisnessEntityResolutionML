@@ -38,7 +38,10 @@ Cross-Field Features (~6):
     28. name_high_postal_match   name_sim > 0.85 AND postal code match
 """
 import os
+import pickle
+import tempfile
 import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor
 from typing import Dict, List, Set, Tuple, Optional
 
 import numpy as np
@@ -466,6 +469,102 @@ def _build_features_parallel(
     return features_df, all_s1, all_target
 
 
+# ── Windows / spawn path ──────────────────────────────────────────────────────
+# Windows has no fork, so workers can't inherit parent memory. The parent dumps
+# the value arrays to temp files once; each worker loads them via the pool
+# initializer (memory cost = workers x arrays), then processes position slices.
+_SPAWN_CTX: dict = {}
+
+
+def _spawn_init(s1_pkl: str, t_pkl: str) -> None:
+    with open(s1_pkl, 'rb') as f:
+        _SPAWN_CTX['s1'] = pickle.load(f)
+    with open(t_pkl, 'rb') as f:
+        _SPAWN_CTX['t'] = pickle.load(f)
+
+
+def _spawn_feature_worker(task):
+    start, s1_pos, t_pos = task
+    s1_arrays = _SPAWN_CTX['s1']
+    t_arrays = _SPAWN_CTX['t']
+    out = np.empty((len(s1_pos), len(FEATURE_NAMES)), dtype=np.float32)
+    for i in range(len(s1_pos)):
+        a = int(s1_pos[i])
+        b = int(t_pos[i])
+        s1v = [_safe_str(s1_arrays[c][a]) for c in LOOKUP_FIELDS]
+        tv = [_safe_str(t_arrays[c][b]) for c in LOOKUP_FIELDS]
+        out[i] = compute_pair_features(
+            s1v[0], s1v[1], s1v[2], s1v[3], s1v[4], s1v[5], s1v[6],
+            tv[0], tv[1], tv[2], tv[3], tv[4], tv[5], tv[6], tv[7])
+    return start, out
+
+
+def _build_features_spawn(
+    s1_df: pd.DataFrame,
+    target_lookup: "TargetLookup",
+    candidate_pairs: Dict[str, Set[str]],
+    n_workers: int,
+) -> Tuple[pd.DataFrame, List[str], List[str]]:
+    s1 = s1_df.reset_index(drop=True)
+    s1_ids_arr = s1[ID_COL].to_numpy()
+    s1_index = pd.Index(s1_ids_arr)
+    s1_arrays = {c: s1[c].to_numpy() for c in LOOKUP_FIELDS}
+
+    ids = [sid for sid in candidate_pairs if candidate_pairs[sid]]
+    s1_pos_of = s1_index.get_indexer(ids)
+    keep = s1_pos_of >= 0
+    ids = [sid for sid, k in zip(ids, keep) if k]
+    s1_pos_of = s1_pos_of[keep]
+
+    s1_chunks, t_chunks = [], []
+    for sid, a in zip(ids, s1_pos_of):
+        tpos = target_lookup.positions(sorted(candidate_pairs[sid]))
+        m = tpos >= 0
+        if not m.any():
+            continue
+        tpi = tpos[m].astype(np.int32)
+        s1_chunks.append(np.full(len(tpi), a, dtype=np.int32))
+        t_chunks.append(tpi)
+    if s1_chunks:
+        s1_pos = np.concatenate(s1_chunks)
+        t_pos = np.concatenate(t_chunks)
+    else:
+        s1_pos = np.empty(0, np.int32)
+        t_pos = np.empty(0, np.int32)
+    n_total = len(s1_pos)
+
+    tmpdir = tempfile.mkdtemp(prefix='er_feat_')
+    s1_pkl = os.path.join(tmpdir, 's1.pkl')
+    t_pkl = os.path.join(tmpdir, 't.pkl')
+    with open(s1_pkl, 'wb') as f:
+        pickle.dump(s1_arrays, f, protocol=5)
+    with open(t_pkl, 'wb') as f:
+        pickle.dump(target_lookup.arrays, f, protocol=5)
+
+    n_slices = max(1, int(n_workers) * 4)
+    bounds = np.linspace(0, n_total, n_slices + 1).astype(int)
+    tasks = [(int(bounds[i]), s1_pos[bounds[i]:bounds[i + 1]], t_pos[bounds[i]:bounds[i + 1]])
+             for i in range(n_slices) if bounds[i] < bounds[i + 1]]
+
+    results: Dict[int, np.ndarray] = {}
+    with ProcessPoolExecutor(max_workers=n_workers, initializer=_spawn_init,
+                             initargs=(s1_pkl, t_pkl)) as ex:
+        for start, arr in ex.map(_spawn_feature_worker, tasks):
+            results[start] = arr
+    feats = (np.vstack([results[t[0]] for t in tasks]) if tasks
+             else np.empty((0, len(FEATURE_NAMES)), dtype=np.float32))
+    features_df = pd.DataFrame(feats, columns=FEATURE_NAMES)
+    all_s1 = [str(x) for x in s1_ids_arr[s1_pos]]
+    all_target = [str(x) for x in target_lookup.id_array[t_pos]]
+    try:
+        os.remove(s1_pkl)
+        os.remove(t_pkl)
+        os.rmdir(tmpdir)
+    except OSError:
+        pass
+    return features_df, all_s1, all_target
+
+
 def build_feature_matrix(
     s1_df: pd.DataFrame,
     target_df: pd.DataFrame,
@@ -497,8 +596,11 @@ def build_feature_matrix(
 
     # Multiprocess path (fork only); keeps row order deterministic because the
     # contiguous ranges are reassembled by ascending start offset.
-    if n_workers and n_workers > 1 and hasattr(os, 'fork') and len(candidate_pairs) >= 2000:
-        return _build_features_parallel(
+    if n_workers and n_workers > 1 and len(candidate_pairs) >= 2000:
+        if hasattr(os, 'fork'):
+            return _build_features_parallel(
+                s1_df, target_lookup, candidate_pairs, int(n_workers))
+        return _build_features_spawn(
             s1_df, target_lookup, candidate_pairs, int(n_workers))
 
     s1 = s1_df.reset_index(drop=True)

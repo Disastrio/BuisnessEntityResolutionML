@@ -28,7 +28,7 @@ from src.blocking import (
 )
 from src.features import (
     FEATURE_NAMES, TargetLookup, restrict_to_core_columns, build_feature_matrix,
-    _build_features_parallel, compute_pair_features, token_jaccard,
+    _build_features_parallel, _build_features_spawn, compute_pair_features, token_jaccard,
     char_ngram_jaccard, containment_ratio, token_overlap_count,
     numeric_token_jaccard, numeric_token_overlap, postal_match, length_diff_ratio,
 )
@@ -435,9 +435,6 @@ def test_chunked_inference():
 
 def test_parallel_features():
     print("\n[9] Parallel feature building")
-    if not hasattr(os, "fork"):
-        check("parallel features skipped (no fork on this OS)", True)
-        return
     s1 = restrict_to_core_columns(normalize_dataframe(pd.DataFrame([
         raw("smith enterprises", "9 beta avenue abc 99999", "US"),
         raw("acme corp", "1 main st 11111", "US"),
@@ -455,17 +452,23 @@ def test_parallel_features():
 
     f_ser, si_s, ti_s = build_feature_matrix(
         s1, target_df, cands, show_progress=False, target_lookup=tl)
-    f_par, si_p, ti_p = _build_features_parallel(s1, tl, cands, 2)
+    if hasattr(os, "fork"):
+        f_par, si_p, ti_p = _build_features_parallel(s1, tl, cands, 2)
+        pname = "fork"
+    else:
+        f_par, si_p, ti_p = _build_features_spawn(s1, tl, cands, 2)
+        pname = "spawn"
     # Parallel path returns float32; serial returns float64. Compare after casting.
     same_vals = np.array_equal(
         f_par.to_numpy(), f_ser.to_numpy().astype(np.float32))
-    check("parallel features identical to serial",
+    check(f"parallel features ({pname}) identical to serial",
           same_vals and si_p == si_s and ti_p == ti_s,
           f"{f_par.shape} vs {f_ser.shape}")
 
-    cands_par = _generate_candidates_parallel(s1, bundle, 100, 2)
-    check("parallel candidate gen identical to serial",
-          cands_par == cands, f"{cands_par} vs {cands}")
+    if hasattr(os, "fork"):
+        cands_par = _generate_candidates_parallel(s1, bundle, 100, 2)
+        check("parallel candidate gen identical to serial",
+              cands_par == cands, f"{cands_par} vs {cands}")
 
     # Parallel normalization equivalence
     r1 = pd.DataFrame([raw("Acme Pvt. Ltd.", "12 Main St 10001", "US")]).assign(entity_id=["A1"])
