@@ -20,7 +20,10 @@ from rapidfuzz import fuzz, distance
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.normalize import normalize_dataframe, normalize_all_sources
+from src.normalize import (
+    normalize_dataframe, normalize_all_sources, normalize_name, normalize_address,
+    unicode_normalize, LEGAL_SUFFIXES, ADDRESS_ABBREVS,
+)
 from src.blocking import (
     soundex, build_candidate_indices, _ranked_candidates_for_s1,
     generate_all_candidates, build_all_indices, generate_candidates_from_bundle,
@@ -343,15 +346,27 @@ def test_blocking_recall_fixes():
     s1 = normalize_dataframe(pd.DataFrame([
         raw("alpha beta", "1 road 22222", "US"),
     ]).assign(entity_id=["S1-1"]), "S1")
+    # A large *broad* block must not starve the relaxed block out of the cap.
+    # (Exact-name candidates are intentionally excluded here: they always take
+    # top priority by design — see ACCURACY_TODO Item 2.)
     big = [f"S2-{i:05d}" for i in range(300)]
     indices = {
-        "exact_name": {"us|alpha beta": big},
+        "name_prefix": {"us|pfx|alpha ": big},
         "relaxed_name": {"us|rel|alph": ["TARGET"]},
     }
     ranked = _ranked_candidates_for_s1(
         s1.iloc[0], indices, rare_tokens=set(), max_candidates=100)
     check("late block not starved by cap", "TARGET" in ranked, f"size={len(ranked)}")
     check("cap respected with round-robin", len(ranked) == 100, f"{len(ranked)}")
+
+    # Item 2: an exact-name candidate is kept even alongside many distractors.
+    indices2 = {
+        "exact_name": {"us|alpha beta": ["EXACTMATCH"]},
+        "name_prefix": {"us|pfx|alpha ": [f"S2-{i:05d}" for i in range(500)]},
+    }
+    ranked2 = _ranked_candidates_for_s1(
+        s1.iloc[0], indices2, rare_tokens=set(), max_candidates=100)
+    check("exact-name candidate always kept", "EXACTMATCH" in ranked2)
 
 
 def test_chunked_inference():
@@ -515,7 +530,8 @@ def _reference_features(a, b):
     name_jw = distance.JaroWinkler.similarity(s1_name, t_name) if s1_name and t_name else 0.0
     name_tsort = fuzz.token_sort_ratio(s1_name, t_name) / 100.0 if s1_name and t_name else 0.0
     name_tset = fuzz.token_set_ratio(s1_name, t_name) / 100.0 if s1_name and t_name else 0.0
-    name_jacc = token_jaccard(s1_name_tokens, t_name_tokens)
+    name_jacc = (token_jaccard(s1_name_tokens, t_name_tokens)
+                 if (s1_name_tokens and t_name_tokens) else 0.0)
     name_ngram = char_ngram_jaccard(s1_name, t_name)
     name_contain = containment_ratio(s1_name_tokens, t_name_tokens)
     name_tok_overlap = float(token_overlap_count(s1_name_tokens, t_name_tokens))
@@ -529,11 +545,13 @@ def _reference_features(a, b):
         name_common_ratio = 0.0
     addr_exact = 1.0 if s1_addr == t_addr and s1_addr else 0.0
     addr_lev = fuzz.ratio(s1_addr, t_addr) / 100.0 if s1_addr and t_addr else 0.0
-    addr_tok_jacc = token_jaccard(s1_addr, t_addr)
+    addr_tok_jacc = (token_jaccard(s1_addr, t_addr)
+                     if (s1_addr and t_addr) else 0.0)
     addr_tok_overlap = float(token_overlap_count(s1_addr, t_addr))
     addr_ngram = char_ngram_jaccard(s1_addr, t_addr)
     addr_len_d = length_diff_ratio(s1_addr, t_addr)
-    addr_num_jacc = numeric_token_jaccard(s1_addr_numeric, t_addr_numeric)
+    addr_num_jacc = (numeric_token_jaccard(s1_addr_numeric, t_addr_numeric)
+                     if (s1_addr_numeric and t_addr_numeric) else 0.0)
     addr_num_overlap = float(numeric_token_overlap(s1_addr_numeric, t_addr_numeric))
     addr_post_match = postal_match(s1_addr_postal, t_addr_postal)
     addr_contain = containment_ratio(s1_addr, t_addr)
@@ -545,7 +563,8 @@ def _reference_features(a, b):
     name_high_addr_h = 1.0 if name_high_sim and addr_high_sim else 0.0
     has_mis = (s1_addr_numeric and t_addr_numeric
                and not (set(s1_addr_numeric.split()) & set(t_addr_numeric.split())))
-    name_high_addr_mis = 1.0 if name_lev > 0.90 and has_mis else 0.0
+    name_high_addr_mis = 1.0 if (
+        (name_lev > 0.85 or name_tset > 0.90) and has_mis) else 0.0
     name_high_postal = 1.0 if name_high_sim and addr_post_match else 0.0
     return [name_exact, name_lev, name_jw, name_tsort, name_tset, name_jacc, name_ngram,
             name_contain, name_tok_overlap, name_len_d, name_pfx_match, name_common_ratio,
@@ -592,6 +611,108 @@ def test_feature_equivalence():
           f"{mismatches} mismatches")
 
 
+def test_resume_inference():
+    print("\n[12] Checkpoint / resume inference")
+    s1 = restrict_to_core_columns(normalize_dataframe(pd.DataFrame([
+        raw("smith enterprises", "9 beta avenue abc 99999", "US"),
+        raw("acme corp", "1 main st 11111", "US"),
+        raw("lone wolf", "2 nowhere rd 55555", "US"),
+    ]).assign(entity_id=["S1-1", "S1-2", "S1-3"]), "S1"))
+    s2 = restrict_to_core_columns(normalize_dataframe(pd.DataFrame([
+        raw("smyth enterprises", "1 alpha road xyz 11111", "US"),
+    ]).assign(entity_id=["S2-1"]), "S2"))
+    s3 = restrict_to_core_columns(normalize_dataframe(pd.DataFrame([
+        raw("smith enterprises", "9 beta avenue abc 99999", "US"),
+    ]).assign(entity_id=["S3-1"]), "S3"))
+
+    def score_fn(feats, tids):
+        return np.array([0.9 if t == "S3-1" else 0.1 for t in tids])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        mpath = tmp / "m.tsv"
+        cpath = tmp / "c.tsv"
+        run_chunked_inference(
+            s1, s2, s3, score_fn, threshold=0.7, use_rules=False, chunk_size=1,
+            matching_path=mpath, candidate_path=cpath, show_progress=False)
+        # simulate an interruption: keep header + first data row only
+        ml = mpath.read_text(encoding="utf-8").splitlines()
+        mpath.write_text("\n".join(ml[:2]) + "\n", encoding="utf-8")
+        cl = cpath.read_text(encoding="utf-8").splitlines()
+        cpath.write_text("\n".join(cl[:2]) + "\n", encoding="utf-8")
+
+        run_chunked_inference(
+            s1, s2, s3, score_fn, threshold=0.7, use_rules=False, chunk_size=1,
+            matching_path=mpath, candidate_path=cpath, show_progress=False,
+            resume=True)
+        ml2 = mpath.read_text(encoding="utf-8").splitlines()
+        check("resume completes all rows", len(ml2) == 4, f"{len(ml2)} lines")
+        d = {ln.split("\t")[0]: ln.split("\t")[1] for ln in ml2[1:]}
+        check("resume preserves results",
+              d == {"S1-1": "S3-1", "S1-2": "", "S1-3": ""}, f"{d}")
+
+
+def test_normalize_equivalence():
+    print("\n[13] Combined-regex normalization matches sequential")
+    import re as _re
+
+    def ref(text, pairs, spacing=False):
+        text = unicode_normalize(text)
+        text = _re.sub(r'\s*&\s*', ' and ', text)
+        if spacing:
+            text = _re.sub(r'(\d+)([a-z]+)', r'\1 \2', text)
+            text = _re.sub(r'([a-z]+)(\d+)', r'\1 \2', text)
+        for pat, rep in pairs:
+            text = _re.sub(pat, rep, text)
+        text = _re.sub(r'[^a-z0-9\s]', ' ', text)
+        return _re.sub(r'\s+', ' ', text).strip()
+
+    rng = random.Random(1)
+    toks = ["ABC", "Pvt.", "Ltd.", "Corp", "&", "Sons", "Inc", "LLC", "Co",
+            "Assoc", "St.", "Rd", "Ave", "Blvd", "Dr", "Ln", "Hwy", "Bldg",
+            "Apt", "Nr", "Opp", "Mfg", "Grp", "Intl", "12", "Main"]
+    mism = 0
+    for _ in range(500):
+        s = " ".join(rng.choice(toks) for _ in range(rng.randint(1, 6)))
+        if normalize_name(s) != ref(s, LEGAL_SUFFIXES):
+            mism += 1
+            if mism == 1:
+                print("   name:", repr(s), normalize_name(s), "|", ref(s, LEGAL_SUFFIXES))
+    for _ in range(500):
+        s = " ".join(rng.choice(toks) for _ in range(rng.randint(1, 6)))
+        if normalize_address(s) != ref(s, ADDRESS_ABBREVS, spacing=True):
+            mism += 1
+            if mism == 1:
+                print("   addr:", repr(s), normalize_address(s),
+                      "|", ref(s, ADDRESS_ABBREVS, spacing=True))
+    check("combined regex == sequential (1000 cases)", mism == 0, f"{mism} mismatches")
+
+
+def test_normalization_fixes():
+    print("\n[14] Normalization audit fixes (1.1-1.4)")
+    from src.normalize import extract_postal_codes
+    # 1.1 French / EU legal suffixes
+    check("SARL normalized",
+          normalize_name("Boulangerie Paul SARL") == normalize_name("Boulangerie Paul S.A.R.L."),
+          normalize_name("Boulangerie Paul SARL"))
+    check("SAS normalized", "sas" in normalize_name("Acme SAS").split())
+    check("GmbH handled", "gmbh" in normalize_name("Bauer GmbH").split())
+    # 1.2 country-aware postal: Indian plot number must not be treated as ZIP
+    check("India postal ignores plot number",
+          extract_postal_codes("plot 12042 mg road bengaluru 560001", "india") == "560001")
+    check("US 5-digit zip", extract_postal_codes("123 main st 90210", "us") == "90210")
+    # 1.3 alphanumeric house number recovered
+    from src.normalize import extract_numeric_tokens
+    check("42B house number recovered",
+          extract_numeric_tokens(normalize_address("Flat 42B")) == "42",
+          normalize_address("Flat 42B"))
+    # 1.4 regional abbreviations
+    check("sector/phase expanded",
+          "sector" in normalize_address("Sec 14 Phase 2") and
+          "phase" in normalize_address("Sec 14 Phase 2"),
+          normalize_address("Sec 14 Phase 2"))
+
+
 def main():
     print("=" * 70)
     print("  Model Improvement Verification (E4-E8 + Index 6)")
@@ -607,6 +728,9 @@ def main():
     test_parallel_features()
     test_parallel_sweeps()
     test_feature_equivalence()
+    test_resume_inference()
+    test_normalize_equivalence()
+    test_normalization_fixes()
 
     print("\n" + "=" * 70)
     print(f"  RESULT: {_PASS} passed, {_FAIL} failed")

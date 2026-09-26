@@ -218,10 +218,11 @@ class TsvListWriter:
     empty field (the required singleton representation).
     """
 
-    def __init__(self, path, second_column: str):
+    def __init__(self, path, second_column: str, append: bool = False):
         self.path = path
-        self._f = open(path, 'w', encoding='utf-8', newline='')
-        self._f.write(f"{GT_S1_COL}\t{second_column}\n")
+        self._f = open(path, 'a' if append else 'w', encoding='utf-8', newline='')
+        if not append:
+            self._f.write(f"{GT_S1_COL}\t{second_column}\n")
 
     def write(self, s1_id: str, ids: Set[str]) -> None:
         payload = ','.join(sorted(ids)) if ids else ''
@@ -252,6 +253,7 @@ def run_chunked_inference(
     candidate_path=CANDIDATE_OUT,
     limit_s1: Optional[int] = None,
     n_workers: int = 1,
+    resume: bool = False,
     show_progress: bool = True,
 ) -> dict:
     """
@@ -275,11 +277,31 @@ def run_chunked_inference(
     """
     from tqdm import tqdm
 
+    import os
+
     s1 = s1_df.reset_index(drop=True)
     if limit_s1 is not None:
         s1 = s1.iloc[:limit_s1]
+
+    # Resume: outputs are written in sorted-S1 order, so the number of data rows
+    # already present in matching_results.tsv tells us where to continue.
+    append = False
+    if resume and os.path.exists(matching_path):
+        try:
+            with open(matching_path, 'r', encoding='utf-8') as f:
+                done = max(0, sum(1 for _ in f) - 1)
+        except OSError:
+            done = 0
+        if done:
+            s1 = s1.iloc[done:]
+            append = True
+            print(f"  [resume] {done:,} S1 already written; continuing", flush=True)
+
     if len(s1) == 0:
-        raise ValueError("No S1 entities to score.")
+        print("  [resume] nothing left to score.", flush=True)
+        return {'s1_written': 0, 'entities_with_matches': 0, 'total_matches': 0,
+                'total_candidates': 0, 'avg_candidates_per_s1': 0.0,
+                'superset_violations': 0}
 
     # Fixed cost: target frame + blocking indices, built exactly once.
     target_df = pd.concat([s2_df, s3_df], ignore_index=True)
@@ -297,8 +319,8 @@ def run_chunked_inference(
     if show_progress:
         iterator = tqdm(starts, desc="Inference chunks")
 
-    with TsvListWriter(matching_path, GT_MATCH_COL) as mw, \
-            TsvListWriter(candidate_path, CAND_MATCH_COL) as cw:
+    with TsvListWriter(matching_path, GT_MATCH_COL, append=append) as mw, \
+            TsvListWriter(candidate_path, CAND_MATCH_COL, append=append) as cw:
         for start in iterator:
             chunk = s1.iloc[start:start + chunk_size]
             chunk_ids = set(chunk[ID_COL])

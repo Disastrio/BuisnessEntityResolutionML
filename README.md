@@ -224,12 +224,30 @@ override). Each forked worker copies pages it touches, so **memory grows with wo
 count** — on a 16-core / 32 GB box, keep the training sample bounded:
 
 ```bash
-# 16 cores, 32 GB: safe training run
-python -m src.pipeline --mode train --sample 200000 --max-candidates 250 --workers 16
+# Linux/macOS, 16 cores / 32 GB: fast training run
+python -m src.pipeline --mode train --sample 100000 --max-candidates 50 --workers 16
 
-# if RAM gets tight (fork copy-on-write), reduce workers
+# Native Windows (spawn): default workers is capped at 6; use ~100k sample
+python -m src.pipeline --mode train --sample 100000 --max-candidates 50 --workers 6
+
+# Maximum-recall variant (slower, more candidates)
 python -m src.pipeline --mode train --sample 200000 --max-candidates 250 --workers 8
 ```
+
+**16 GB RAM recipe (e.g. Windows, RTX 4050 — GPU is not used; LightGBM is CPU):**
+```bash
+python -m src.pipeline --mode train --sample 50000 --max-candidates 40 \
+    --neg-ratio 10 --workers 4
+```
+`--neg-ratio 10` keeps every positive and hard negative but only ~10 easy negatives
+per positive, bounding the feature matrix to a few hundred MB. `--workers 4` avoids
+spawn array duplication. This should stay well under ~6 GB.
+
+Guidance: `--max-candidates 40–50` roughly halves feature-generation time with near-
+identical F0.5 (ranking keeps true matches + hard negatives); a `50–100k` aligned
+sample fits comfortably in 16–32 GB. On Windows keep `--workers ≤ 6` (spawn duplicates
+arrays). LightGBM uses histogram binning (`max_bin=255`), `learning_rate=0.08`, 800
+trees with early stopping 30 — trains in well under a minute on this feature space.
 
 | Workload | Heavy phase | Speedup with more cores | Memory driver |
 |---|---|---|---|

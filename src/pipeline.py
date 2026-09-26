@@ -51,6 +51,7 @@ from src.train import (
     save_model, load_model, print_feature_importance,
     compute_sample_weights, train_dual_models,
     save_dual_models, load_dual_models, predict_dual_probabilities,
+    identify_hard_negatives,
 )
 from src.evaluate import (
     detailed_evaluation, threshold_sweep,
@@ -87,6 +88,7 @@ def run_training(
     barrier: Optional[float] = None,
     max_candidates: Optional[int] = None,
     workers: Optional[int] = None,
+    neg_ratio: Optional[float] = None,
 ):
     """
     Full training pipeline:
@@ -194,6 +196,29 @@ def run_training(
     # dict and target frame are no longer needed once features are built.
     features = features.astype(np.float32)
     del candidates, target_df
+
+    # Optional negative subsampling to bound peak memory (16 GB machines):
+    # keep every positive and every hard negative, then a random subset of the
+    # remaining (easy) negatives.
+    if neg_ratio is not None and neg_ratio > 0:
+        pos_mask = labels > 0.5
+        n_pos = int(pos_mask.sum())
+        if n_pos > 0:
+            hard = identify_hard_negatives(features, labels)
+            hard_idx = np.where(hard)[0]
+            other_idx = np.where(~pos_mask & ~hard)[0]
+            budget = max(0, int(n_pos * neg_ratio) - len(hard_idx))
+            _rng = np.random.RandomState(SEED)
+            if len(other_idx) > budget:
+                other_idx = _rng.choice(other_idx, size=budget, replace=False)
+            keep = np.concatenate([np.where(pos_mask)[0], hard_idx, other_idx])
+            keep.sort()
+            features = features.iloc[keep].reset_index(drop=True)
+            labels = labels[keep]
+            s1_ids = [s1_ids[i] for i in keep]
+            target_ids = [target_ids[i] for i in keep]
+            print(f"  [mem] negatives subsampled (ratio {neg_ratio}): "
+                  f"{len(labels):,} pairs ({n_pos:,} positives)")
 
     print(f"\n  Feature matrix: {features.shape}")
     print(f"  Positive pairs: {int(labels.sum()):,}")
@@ -336,6 +361,7 @@ def run_training(
         'use_hard_negatives': USE_HARD_NEGATIVES,
         'dual_model': dual_models is not None,
         'max_candidates': max_candidates,
+        'neg_ratio': neg_ratio,
         'tuned_macro_f05': best_score,
     }
 
@@ -363,6 +389,7 @@ def run_prediction(
     max_candidates: Optional[int] = None,
     barrier: Optional[float] = None,
     workers: Optional[int] = None,
+    resume: bool = False,
 ):
     """
     Full test inference pipeline (chunked / streaming):
@@ -468,6 +495,7 @@ def run_prediction(
         chunk_size=chunk_size,
         limit_s1=limit_s1,
         n_workers=FEATURE_WORKERS,
+        resume=resume,
     )
     print(f"  {_elapsed(t)}")
 
@@ -562,6 +590,15 @@ def main():
         help='Process pool size for normalize/blocking/features/sweeps '
              '(default: CPU count; lower it if RAM is tight)'
     )
+    parser.add_argument(
+        '--resume', action='store_true',
+        help='Predict: continue from existing output files (skip already-written S1)'
+    )
+    parser.add_argument(
+        '--neg-ratio', type=float, default=None,
+        help='Train: max negatives per positive (keeps all positives + hard '
+             'negatives). Bounds memory on small-RAM machines, e.g. 10'
+    )
     args = parser.parse_args()
 
     train_kwargs = dict(
@@ -572,6 +609,7 @@ def main():
         barrier=args.barrier,
         max_candidates=args.max_candidates,
         workers=args.workers,
+        neg_ratio=args.neg_ratio,
     )
 
     if args.mode == 'smoke':
@@ -595,6 +633,7 @@ def main():
             max_candidates=args.max_candidates,
             barrier=args.barrier,
             workers=args.workers,
+            resume=args.resume,
         )
 
 

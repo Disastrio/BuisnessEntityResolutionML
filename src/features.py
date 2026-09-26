@@ -212,6 +212,102 @@ def _pair_jaccard(ga: Set[str], gb: Set[str], a_nonempty: bool, b_nonempty: bool
     return len(ga & gb) / union if union else 0.0
 
 
+def _record_components(name, addr, name_tokens, addr_numeric, addr_postal,
+                       name_prefix, country, source):
+    """
+    Precompute per-record derived values ONCE, so they are reused across all of
+    the record's candidate pairs (feature engineering is 70-80% of runtime and
+    previously rebuilt these sets for every pair).
+    """
+    nt = name_tokens or ''
+    an = addr_numeric or ''
+    ap = addr_postal or ''
+    return (
+        name, addr, country, source, name_prefix or '',
+        len(name), len(addr),
+        set(nt.split()) if nt else set(),
+        _char_trigrams(name) if name else set(),
+        set(addr.split()) if addr else set(),
+        _char_trigrams(addr) if addr else set(),
+        set(an.split()) if an else set(),
+        set(x for x in ap.split(',') if x) if ap else set(),
+    )
+
+
+def _pair_features(s1c, tc) -> List[float]:
+    """Compute the 28 features from two precomputed component tuples."""
+    (s1_name, s1_addr, s1_country, _s1_src, s1_pfx, s1_len, s1_alen,
+     sa, ga, aa, aga, na, pa) = s1c
+    (t_name, t_addr, t_country, t_source, t_pfx, t_len, t_alen,
+     sb, gb, ab, agb, nb, pb) = tc
+
+    name_exact = 1.0 if s1_name == t_name and s1_name else 0.0
+    if s1_name and t_name:
+        name_lev = fuzz.ratio(s1_name, t_name) / 100.0
+        name_jw = distance.JaroWinkler.similarity(s1_name, t_name)
+        name_tsort = fuzz.token_sort_ratio(s1_name, t_name) / 100.0
+        name_tset = fuzz.token_set_ratio(s1_name, t_name) / 100.0
+    else:
+        name_lev = name_jw = name_tsort = name_tset = 0.0
+
+    n_inter = len(sa & sb)
+    n_union = len(sa | sb)
+    # Empty evidence => 0.0 (NOT 1.0): two records with no tokens must not look
+    # like a perfect Jaccard match (false-positive merges).
+    name_jacc = n_inter / n_union if n_union else 0.0
+    n_min = min(len(sa), len(sb))
+    name_contain = n_inter / n_min if n_min else 0.0
+    name_tok_overlap = float(n_inter)
+    name_common_ratio = n_inter / n_union if n_union > 0 else 0.0
+    name_ngram = _pair_jaccard(ga, gb, bool(s1_name), bool(t_name))
+    name_len_d = abs(s1_len - t_len) / max(s1_len, t_len) if max(s1_len, t_len) else 0.0
+    name_pfx_match = 1.0 if s1_pfx == t_pfx and s1_pfx else 0.0
+
+    addr_exact = 1.0 if s1_addr == t_addr and s1_addr else 0.0
+    addr_lev = fuzz.ratio(s1_addr, t_addr) / 100.0 if s1_addr and t_addr else 0.0
+    a_inter = len(aa & ab)
+    a_union = len(aa | ab)
+    addr_tok_jacc = a_inter / a_union if a_union else 0.0
+    a_min = min(len(aa), len(ab))
+    addr_contain = a_inter / a_min if a_min else 0.0
+    addr_tok_overlap = float(a_inter)
+    addr_ngram = _pair_jaccard(aga, agb, bool(s1_addr), bool(t_addr))
+    addr_len_d = abs(s1_alen - t_alen) / max(s1_alen, t_alen) if max(s1_alen, t_alen) else 0.0
+
+    nu_inter = len(na & nb)
+    nu_union = len(na | nb)
+    addr_num_jacc = nu_inter / nu_union if nu_union else 0.0
+    addr_num_overlap = float(nu_inter)
+    has_addr_numeric_mismatch = bool(na) and bool(nb) and nu_inter == 0
+
+    addr_post_match = 1.0 if (pa and pb and (pa & pb)) else 0.0
+
+    same_ctry = 1.0 if s1_country == t_country and s1_country else 0.0
+    is_s2 = 1.0 if t_source == 'S2' else 0.0
+    both_exact = 1.0 if name_exact and addr_exact else 0.0
+    name_high_sim = name_lev > 0.85
+    addr_high_sim = addr_lev > 0.70
+    name_high_addr_h = 1.0 if name_high_sim and addr_high_sim else 0.0
+    # Chain-branch guard: trigger on high edit similarity OR high token-set
+    # similarity (token-set stays high when city/locality appendages lower
+    # Levenshtein), combined with incompatible numeric addresses.
+    name_high_addr_mis = 1.0 if (
+        (name_lev > 0.85 or name_tset > 0.90) and has_addr_numeric_mismatch
+    ) else 0.0
+    name_high_postal = 1.0 if name_high_sim and addr_post_match else 0.0
+
+    return [
+        name_exact, name_lev, name_jw, name_tsort, name_tset,
+        name_jacc, name_ngram, name_contain, name_tok_overlap,
+        name_len_d, name_pfx_match, name_common_ratio,
+        addr_exact, addr_lev, addr_tok_jacc, addr_tok_overlap,
+        addr_ngram, addr_len_d, addr_num_jacc, addr_num_overlap,
+        addr_post_match, addr_contain,
+        same_ctry, is_s2, both_exact,
+        name_high_addr_h, name_high_addr_mis, name_high_postal,
+    ]
+
+
 def compute_pair_features(
     s1_name: str,
     s1_addr: str,
@@ -229,110 +325,12 @@ def compute_pair_features(
     t_name_prefix: str,
     t_source: str,
 ) -> List[float]:
-    """
-    Compute all ~28 pairwise features for one (S1, S2/S3) candidate pair.
-
-    Returns list of floats in FEATURE_NAMES order.
-    """
-    # ── Name Features ─────────────────────────────────────────────────────
-    # Each token/ngram set is built once and reused (was rebuilt per feature).
-    name_exact = 1.0 if s1_name == t_name and s1_name else 0.0
-
-    if s1_name and t_name:
-        name_lev = fuzz.ratio(s1_name, t_name) / 100.0
-        name_jw = distance.JaroWinkler.similarity(s1_name, t_name)
-        name_tsort = fuzz.token_sort_ratio(s1_name, t_name) / 100.0
-        name_tset = fuzz.token_set_ratio(s1_name, t_name) / 100.0
-    else:
-        name_lev = name_jw = name_tsort = name_tset = 0.0
-
-    if s1_name_tokens and t_name_tokens:
-        sa = set(s1_name_tokens.split())
-        sb = set(t_name_tokens.split())
-        n_inter = len(sa & sb)
-        n_union = len(sa | sb)
-        name_jacc = n_inter / n_union if n_union else 0.0
-        n_min = min(len(sa), len(sb))
-        name_contain = n_inter / n_min if n_min else 0.0
-        name_tok_overlap = float(n_inter)
-        name_common_ratio = n_inter / n_union if n_union > 0 else 0.0
-    else:
-        name_jacc = 1.0 if (not s1_name_tokens and not t_name_tokens) else 0.0
-        name_contain = 0.0
-        name_tok_overlap = 0.0
-        name_common_ratio = 0.0
-
-    name_ngram = _pair_jaccard(_char_trigrams(s1_name), _char_trigrams(t_name),
-                               bool(s1_name), bool(t_name))
-    name_len_d = length_diff_ratio(s1_name, t_name)
-    name_pfx_match = 1.0 if s1_name_prefix == t_name_prefix and s1_name_prefix else 0.0
-
-    # ── Address Features ──────────────────────────────────────────────────
-    addr_exact = 1.0 if s1_addr == t_addr and s1_addr else 0.0
-    addr_lev = fuzz.ratio(s1_addr, t_addr) / 100.0 if s1_addr and t_addr else 0.0
-
-    if s1_addr and t_addr:
-        aa = set(s1_addr.split())
-        ab = set(t_addr.split())
-        a_inter = len(aa & ab)
-        a_union = len(aa | ab)
-        addr_tok_jacc = a_inter / a_union if a_union else 0.0
-        a_min = min(len(aa), len(ab))
-        addr_contain = a_inter / a_min if a_min else 0.0
-        addr_tok_overlap = float(a_inter)
-    else:
-        addr_tok_jacc = 1.0 if (not s1_addr and not t_addr) else 0.0
-        addr_contain = 0.0
-        addr_tok_overlap = 0.0
-
-    addr_ngram = _pair_jaccard(_char_trigrams(s1_addr), _char_trigrams(t_addr),
-                               bool(s1_addr), bool(t_addr))
-    addr_len_d = length_diff_ratio(s1_addr, t_addr)
-
-    if s1_addr_numeric and t_addr_numeric:
-        na = set(s1_addr_numeric.split())
-        nb = set(t_addr_numeric.split())
-        nu_inter = len(na & nb)
-        nu_union = len(na | nb)
-        addr_num_jacc = nu_inter / nu_union if nu_union else 0.0
-        addr_num_overlap = float(nu_inter)
-        has_addr_numeric_mismatch = nu_inter == 0
-    else:
-        addr_num_jacc = 1.0 if (not s1_addr_numeric and not t_addr_numeric) else 0.0
-        addr_num_overlap = 0.0
-        has_addr_numeric_mismatch = False
-
-    if s1_addr_postal and t_addr_postal:
-        addr_post_match = 1.0 if (set(s1_addr_postal.split(',')) &
-                                  set(t_addr_postal.split(','))) else 0.0
-    else:
-        addr_post_match = 0.0
-
-    # ── Cross-Field Features ──────────────────────────────────────────────
-    same_ctry = 1.0 if s1_country == t_country and s1_country else 0.0
-    is_s2 = 1.0 if t_source == 'S2' else 0.0
-
-    # Combined signals
-    both_exact = 1.0 if name_exact and addr_exact else 0.0
-    name_high_sim = name_lev > 0.85
-    addr_high_sim = addr_lev > 0.70
-    name_high_addr_h = 1.0 if name_high_sim and addr_high_sim else 0.0
-
-    name_high_addr_mis = 1.0 if (name_lev > 0.90 and has_addr_numeric_mismatch) else 0.0
-
-    # High name + postal match
-    name_high_postal = 1.0 if name_high_sim and addr_post_match else 0.0
-
-    return [
-        name_exact, name_lev, name_jw, name_tsort, name_tset,
-        name_jacc, name_ngram, name_contain, name_tok_overlap,
-        name_len_d, name_pfx_match, name_common_ratio,
-        addr_exact, addr_lev, addr_tok_jacc, addr_tok_overlap,
-        addr_ngram, addr_len_d, addr_num_jacc, addr_num_overlap,
-        addr_post_match, addr_contain,
-        same_ctry, is_s2, both_exact,
-        name_high_addr_h, name_high_addr_mis, name_high_postal,
-    ]
+    """Compute all ~28 pairwise features for one (S1, S2/S3) candidate pair."""
+    return _pair_features(
+        _record_components(s1_name, s1_addr, s1_name_tokens, s1_addr_numeric,
+                           s1_addr_postal, s1_name_prefix, s1_country, ''),
+        _record_components(t_name, t_addr, t_name_tokens, t_addr_numeric,
+                           t_addr_postal, t_name_prefix, t_country, t_source))
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -383,8 +381,13 @@ class TargetLookup:
 _FEAT_CTX: dict = {}
 
 
+def _components_from_arrays(arrays, pos: int):
+    v = [_safe_str(arrays[c][pos]) for c in LOOKUP_FIELDS]
+    return _record_components(v[0], v[1], v[3], v[4], v[5], v[6], v[2], v[7])
+
+
 def _feature_worker(bounds: Tuple[int, int]):
-    """Compute features for a contiguous slice of the flattened pair list."""
+    """Compute features for a contiguous slice with per-record component caching."""
     start, end = bounds
     s1_arrays = _FEAT_CTX['s1_arrays']
     t_arrays = _FEAT_CTX['t_arrays']
@@ -392,15 +395,22 @@ def _feature_worker(bounds: Tuple[int, int]):
     t_pos = _FEAT_CTX['t_pos']
 
     out = np.empty((end - start, len(FEATURE_NAMES)), dtype=np.float32)
+    s1_cache: dict = {}
+    t_cache: dict = {}
     for i in range(start, end):
         a = int(s1_pos[i])
         b = int(t_pos[i])
-        s1v = [_safe_str(s1_arrays[c][a]) for c in LOOKUP_FIELDS]
-        tv = [_safe_str(t_arrays[c][b]) for c in LOOKUP_FIELDS]
-        out[i - start] = compute_pair_features(
-            s1v[0], s1v[1], s1v[2], s1v[3], s1v[4], s1v[5], s1v[6],
-            tv[0], tv[1], tv[2], tv[3], tv[4], tv[5], tv[6], tv[7],
-        )
+        c1 = s1_cache.get(a)
+        if c1 is None:
+            c1 = _components_from_arrays(s1_arrays, a)
+            s1_cache[a] = c1
+        c2 = t_cache.get(b)
+        if c2 is None:
+            c2 = _components_from_arrays(t_arrays, b)
+            t_cache[b] = c2
+            if len(t_cache) > 1_500_000:
+                t_cache.clear()
+        out[i - start] = _pair_features(c1, c2)
     return start, out
 
 
@@ -488,14 +498,22 @@ def _spawn_feature_worker(task):
     s1_arrays = _SPAWN_CTX['s1']
     t_arrays = _SPAWN_CTX['t']
     out = np.empty((len(s1_pos), len(FEATURE_NAMES)), dtype=np.float32)
+    s1_cache: dict = {}
+    t_cache: dict = {}
     for i in range(len(s1_pos)):
         a = int(s1_pos[i])
         b = int(t_pos[i])
-        s1v = [_safe_str(s1_arrays[c][a]) for c in LOOKUP_FIELDS]
-        tv = [_safe_str(t_arrays[c][b]) for c in LOOKUP_FIELDS]
-        out[i] = compute_pair_features(
-            s1v[0], s1v[1], s1v[2], s1v[3], s1v[4], s1v[5], s1v[6],
-            tv[0], tv[1], tv[2], tv[3], tv[4], tv[5], tv[6], tv[7])
+        c1 = s1_cache.get(a)
+        if c1 is None:
+            c1 = _components_from_arrays(s1_arrays, a)
+            s1_cache[a] = c1
+        c2 = t_cache.get(b)
+        if c2 is None:
+            c2 = _components_from_arrays(t_arrays, b)
+            t_cache[b] = c2
+            if len(t_cache) > 1_500_000:
+                t_cache.clear()
+        out[i] = _pair_features(c1, c2)
     return start, out
 
 
@@ -616,26 +634,27 @@ def build_feature_matrix(
     if show_progress:
         iterator = tqdm(iterator, desc="Computing features")
 
+    t_comp_cache: dict = {}
     for s1_id in iterator:
         pos = s1_index.get_indexer([s1_id])[0]
         if pos < 0:
             continue
 
-        s1_vals = [_safe_str(s1_arrays[c][pos]) for c in LOOKUP_FIELDS]
+        s1c = _components_from_arrays(s1_arrays, int(pos))
 
         t_ids = sorted(candidate_pairs[s1_id])
         positions = target_lookup.positions(t_ids)
         for t_id, t_pos in zip(t_ids, positions):
             if t_pos < 0:
                 continue
-            t_vals = target_lookup.values(t_pos)
-            feats = compute_pair_features(
-                s1_vals[0], s1_vals[1], s1_vals[2], s1_vals[3],
-                s1_vals[4], s1_vals[5], s1_vals[6],
-                t_vals[0], t_vals[1], t_vals[2], t_vals[3],
-                t_vals[4], t_vals[5], t_vals[6], t_vals[7],
-            )
-            all_features.append(feats)
+            t_pos = int(t_pos)
+            c2 = t_comp_cache.get(t_pos)
+            if c2 is None:
+                c2 = _components_from_arrays(target_lookup.arrays, t_pos)
+                t_comp_cache[t_pos] = c2
+                if len(t_comp_cache) > 1_500_000:
+                    t_comp_cache.clear()
+            all_features.append(_pair_features(s1c, c2))
             all_s1_ids.append(s1_id)
             all_target_ids.append(t_id)
 

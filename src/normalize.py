@@ -25,7 +25,18 @@ from src.config import NAME_COL, ADDR_COL, COUNTRY_COL, ID_COL
 # ── Legal Suffix Canonicalization ─────────────────────────────────────────────
 # Ordered longest-first to prevent partial matches
 LEGAL_SUFFIXES = [
-    # Full → canonical
+    # ── Continental European forms (France/Europe appear in the test set) ──
+    (r'\bsociete\s+a\s+responsabilite\s+limitee\b', 'sarl'),
+    (r'\bsociete\s+par\s+actions\s+simplifiee\b', 'sas'),
+    (r'\bsociete\s+anonyme\b', 'sa'),
+    (r'\bs\.?a\.?r\.?l\.?\b', 'sarl'),
+    (r'\bs\.?a\.?s\.?u\b', 'sasu'),
+    (r'\bs\.?a\.?s\.?\b', 'sas'),
+    (r'\bs\.?c\.?i\.?\b', 'sci'),
+    (r'\be\.?u\.?r\.?l\.?\b', 'eurl'),
+    (r'\bgmbh\b', 'gmbh'),
+    (r'\bs\.?a\.?\b', 'sa'),
+    # ── Anglo-American / Indian forms (longest-first) ──
     (r'\bprivate\s+limited\b', 'private limited'),
     (r'\bpvt\s*\.?\s*ltd\s*\.?\b', 'private limited'),
     (r'\bpvt\b', 'private'),
@@ -87,16 +98,47 @@ ADDRESS_ABBREVS = [
     (r'\bdist\s*\.?\b', 'district'),
     (r'\bnr\s*\.?\b', 'near'),
     (r'\bopp\s*\.?\b', 'opposite'),
+    # Regional (India / France) urban tokens
+    (r'\bsec(?:t)?\s*\.?\b', 'sector'),
+    (r'\bph(?:s)?\s*\.?\b', 'phase'),
+    (r'\bflr\s*\.?\b', 'floor'),
+    (r'\bbeh\s*\.?\b', 'behind'),
+    (r'\bblog\s*\.?\b', 'block'),
+    (r'\bbk\s*\.?\b', 'block'),
+    (r'\bboul\s*\.?\b', 'boulevard'),
 ]
 
 # ── Postal Code Patterns ─────────────────────────────────────────────────────
 # India: 6-digit PIN (e.g. 110001)
 # US: 5-digit ZIP or ZIP+4 (e.g. 90210, 90210-1234)
 # France: 5-digit (e.g. 75001)
-POSTAL_PATTERNS = [
-    re.compile(r'\b(\d{6})\b'),        # India PIN
-    re.compile(r'\b(\d{5}(?:-\d{4})?)\b'),  # US ZIP / France
-]
+# India: 6-digit PIN (first digit 1-9). US/France: 5-digit ZIP (ZIP+4 allowed).
+_INDIA_PIN_RE = re.compile(r'\b[1-9]\d{5}\b')
+_FIVE_DIGIT_RE = re.compile(r'\b\d{5}(?:-\d{4})?\b')
+_ANY_POSTAL_RE = re.compile(r'\b\d{5,6}\b')
+
+# ── Precompiled replacement passes ────────────────────────────────────────────
+# NOTE: these must stay SEQUENTIAL — a single combined alternation changes the
+# result because later patterns would no longer see earlier replacements (e.g.
+# 'co intl' -> 'company intl' vs 'companyinternational'). Precompiling avoids
+# per-call pattern compilation while preserving exact semantics.
+def _compile_with_literal(pairs):
+    """
+    Compile each pattern together with a literal keyword that MUST appear for a
+    match. Guarding on it skips the vast majority of regex passes per row while
+    preserving exact results (if the literal is absent, the regex cannot match).
+    """
+    out = []
+    for pat, rep in pairs:
+        bare = re.sub(r'\\[a-zA-Z]', ' ', pat)   # drop \b, \s, \d, ... escapes
+        m = re.search(r'[a-z]{2,}', bare)
+        out.append(((m.group(0) if m else ''), re.compile(pat), rep))
+    return out
+
+
+_SUFFIX_COMPILED = _compile_with_literal(LEGAL_SUFFIXES)
+_ABBREV_COMPILED = _compile_with_literal(ADDRESS_ABBREVS)
+
 
 # ── Country Normalization ─────────────────────────────────────────────────────
 COUNTRY_MAP = {
@@ -131,83 +173,63 @@ def normalize_country(country: str) -> str:
     return COUNTRY_MAP.get(lookup, cleaned)
 
 
+def normalize_name_pre(text: str) -> str:
+    """Name canonicalization for already NFKD-normalized (lowercase) text."""
+    if not text:
+        return ""
+    text = re.sub(r'\s*&\s*', ' and ', text)
+    for lit, rx, replacement in _SUFFIX_COMPILED:
+        if not lit or lit in text:
+            text = rx.sub(replacement, text)
+    text = re.sub(r'[^a-z0-9\s]', ' ', text)
+    return re.sub(r'\s+', ' ', text).strip()
+
+
 def normalize_name(name: str) -> str:
     """
-    Normalize business name:
-    1. Unicode NFKD → lowercase
-    2. Ampersand → 'and'
-    3. Legal suffix canonicalization
-    4. Remove punctuation (keep alphanumeric + spaces)
-    5. Collapse whitespace
+    Normalize business name: NFKD/lowercase, '&'->'and', legal-suffix
+    canonicalization (incl. French/EU forms), punctuation/whitespace cleanup.
     """
-    if not name:
+    return normalize_name_pre(unicode_normalize(name))
+
+
+def normalize_address_pre(text: str) -> str:
+    """Address canonicalization for already NFKD-normalized (lowercase) text."""
+    if not text:
         return ""
-
-    text = unicode_normalize(name)
-
-    # Ampersand → and
     text = re.sub(r'\s*&\s*', ' and ', text)
-
-    # Legal suffix canonicalization
-    for pattern, replacement in LEGAL_SUFFIXES:
-        text = re.sub(pattern, replacement, text)
-
-    # Remove punctuation but keep alphanumeric and spaces
+    # Split digit<->letter runs so '42b' -> '42 b' (recovers house numbers for
+    # numeric blocking/features; '42b' previously yielded no numeric token).
+    text = re.sub(r'(\d+)([a-z]+)', r'\1 \2', text)
+    text = re.sub(r'([a-z]+)(\d+)', r'\1 \2', text)
+    for lit, rx, replacement in _ABBREV_COMPILED:
+        if not lit or lit in text:
+            text = rx.sub(replacement, text)
     text = re.sub(r'[^a-z0-9\s]', ' ', text)
-
-    # Collapse whitespace
-    text = re.sub(r'\s+', ' ', text).strip()
-
-    return text
+    return re.sub(r'\s+', ' ', text).strip()
 
 
 def normalize_address(address: str) -> str:
+    """Normalize address: NFKD/lowercase, abbreviation expansion, cleanup."""
+    return normalize_address_pre(unicode_normalize(address))
+
+
+def extract_postal_codes(address: str, country: str = "") -> str:
     """
-    Normalize address:
-    1. Unicode NFKD → lowercase
-    2. Expand abbreviations
-    3. Remove punctuation (keep alphanumeric + spaces)
-    4. Collapse whitespace
-    """
-    if not address:
-        return ""
+    Country-aware postal/PIN/ZIP extraction (input already NFKD-normalized).
 
-    text = unicode_normalize(address)
-
-    # Ampersand → and
-    text = re.sub(r'\s*&\s*', ' and ', text)
-
-    # Expand address abbreviations
-    for pattern, replacement in ADDRESS_ABBREVS:
-        text = re.sub(pattern, replacement, text)
-
-    # Remove punctuation but keep alphanumeric and spaces
-    text = re.sub(r'[^a-z0-9\s]', ' ', text)
-
-    # Collapse whitespace
-    text = re.sub(r'\s+', ' ', text).strip()
-
-    return text
-
-
-def extract_postal_codes(address: str) -> str:
-    """
-    Extract all postal/PIN/ZIP codes from address.
-    Returns comma-separated string of found codes, or empty string.
+    Conditioning on country prevents incidental 5-digit street/plot numbers in
+    Indian addresses from being treated as US/French ZIPs (false-positive merges).
     """
     if not address:
         return ""
-    codes = []
-    for pattern in POSTAL_PATTERNS:
-        codes.extend(pattern.findall(address))
-    # Deduplicate while preserving order
-    seen = set()
-    unique = []
-    for c in codes:
-        if c not in seen:
-            seen.add(c)
-            unique.append(c)
-    return ','.join(unique)
+    if country == 'india':
+        codes = _INDIA_PIN_RE.findall(address)
+    elif country in ('us', 'france'):
+        codes = _FIVE_DIGIT_RE.findall(address)
+    else:
+        codes = _ANY_POSTAL_RE.findall(address)
+    return ','.join(dict.fromkeys(codes))   # order-preserving dedupe
 
 
 def extract_numeric_tokens(text: str) -> str:
@@ -265,20 +287,35 @@ def normalize_dataframe(df: pd.DataFrame, source_label: str = "") -> pd.DataFram
         if col in out.columns:
             out[col] = out[col].fillna('').astype(str)
 
-    # Normalize name
-    out['name_clean'] = out[NAME_COL].apply(normalize_name)
-    out['name_tokens'] = out['name_clean'].apply(extract_name_tokens)
-    out['name_prefix'] = out['name_clean'].apply(name_prefix)
+    # NFKD-normalize each raw column exactly ONCE (was re-decomposed per field).
+    name_nfkd = [unicode_normalize(x) for x in out[NAME_COL]]
+    addr_nfkd = [unicode_normalize(x) for x in out[ADDR_COL]]
+    country_nfkd = [unicode_normalize(x) for x in out[COUNTRY_COL]]
 
-    # Normalize address
-    out['addr_clean'] = out[ADDR_COL].apply(normalize_address)
-    out['addr_postal'] = out[ADDR_COL].apply(
-        lambda x: extract_postal_codes(unicode_normalize(x))
-    )
-    out['addr_numeric'] = out['addr_clean'].apply(extract_numeric_tokens)
+    # Names (list comprehensions are ~2x faster than Series.apply)
+    names_clean = [normalize_name_pre(n) for n in name_nfkd]
+    out['name_clean'] = names_clean
+    out['name_tokens'] = [' '.join(sorted(re.findall(r'[a-z]+', n)))
+                          for n in names_clean]
+    out['name_prefix'] = [(n[4:] if n.startswith('the ') else n)[:6]
+                          for n in names_clean]
 
-    # Normalize country (open-string; no hardcoding!)
-    out['country_clean'] = out[COUNTRY_COL].apply(normalize_country)
+    # Countries (open-string; no hardcoding)
+    countries = []
+    for c in country_nfkd:
+        lookup = re.sub(r'[^a-z\s]', '', c).strip()
+        countries.append(COUNTRY_MAP.get(lookup, c))
+    out['country_clean'] = countries
+
+    # Addresses
+    addrs_clean = [normalize_address_pre(a) for a in addr_nfkd]
+    out['addr_clean'] = addrs_clean
+    out['addr_numeric'] = [' '.join(re.findall(r'\b\d+\b', a)) if a else ''
+                           for a in addrs_clean]
+
+    # Postal codes conditioned on the record's country
+    out['addr_postal'] = [extract_postal_codes(a, c)
+                          for a, c in zip(addr_nfkd, countries)]
 
     # Source label
     if source_label:

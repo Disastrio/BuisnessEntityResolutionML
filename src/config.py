@@ -62,6 +62,7 @@ BETA           = 0.5                     # Precision weight in F-beta
 DEFAULT_THRESH = 0.70                    # Conservative starting threshold for F0.5
 MAX_CANDIDATES = 100                     # Max candidate pairs to retain per S1 record
 BLOCK_FETCH_CAP = 1000                   # Max IDs pulled per block per S1 (bounds work)
+MAX_BUCKET_IDS  = 10_000                 # Drop blocking keys larger than this (super-key bloat)
 
 # ── Streaming Inference ───────────────────────────────────────────────────────
 PREDICT_CHUNK_SIZE = 20_000              # S1 entities scored per streaming chunk
@@ -79,7 +80,13 @@ def _default_workers() -> int:
             return max(1, int(env))
         except ValueError:
             pass
-    return max(1, (os.cpu_count() or 1))
+    cpu = max(1, (os.cpu_count() or 1))
+    # Windows uses spawn (no copy-on-write): each worker re-loads the value
+    # arrays, so cap the default to avoid IPC saturation / RAM duplication
+    # (4 is safe on 16 GB machines).
+    if not hasattr(os, 'fork'):
+        return min(cpu, 4)
+    return cpu
 
 
 WORKERS            = _default_workers()
@@ -114,7 +121,8 @@ RULE_THRESHOLD_BOOST    = 0.10           # extra confidence required for risky p
 
 # E8 - Singleton-aware confidence barrier: an S1 entity emits matches only if its
 # single best candidate probability reaches `barrier`. 0.0 disables the guard.
-SINGLETON_BARRIER       = 0.0
+# Activating it protects singletons (empty => 1.0; one weak FP => 0.0).
+SINGLETON_BARRIER       = 0.80
 
 # Blocking: phonetic (Soundex) index (Index 6) - transliteration / typo recovery.
 USE_PHONETIC_BLOCK      = True
