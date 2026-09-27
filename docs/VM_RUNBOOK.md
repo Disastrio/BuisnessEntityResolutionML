@@ -148,12 +148,24 @@ Detach with `Ctrl-b d`, re-attach with `tmux attach -t train`.
 | `ER_LGBM_THREADS` / `OMP_NUM_THREADS` | core count (12) | LightGBM + OpenMP threads |
 | `--max-candidates` | 100 (RAM ≥128 GB) | full-recall candidate cap per S1 |
 | `--neg-ratio` | 10 (RAM ≥128 GB) | keep all positives + hard negatives + ≤10× easy negatives |
-| `--source-thresholds` | on | separate S2/S3 decision thresholds (E5) |
+| `--target-precision` | **0.98** (env `TARGET_PRECISION`) | maximize macro F0.5 s.t. validation pair precision ≥ 0.98 (E9) |
+| `--source-thresholds` | only when `TARGET_PRECISION=` is empty | separate S2/S3 thresholds (E5) |
 | `ER_LGBM_DEVICE` | `cuda` if `--gpu` build present, else `cpu` | LightGBM backend |
 
 The RAM→`(max-candidates, neg-ratio)` mapping is
 `≥128 GB → (100, 10)`, `≥64 GB → (80, 6)`, else `(50, 4)`. Every value is an env
 override, so you can dial it without editing scripts.
+
+**Precision floor (E9).** By default `train_vm.sh` passes `--target-precision 0.98`:
+it jointly tunes threshold × conservative rules × singleton barrier to maximize
+macro F0.5 subject to **validation pair precision ≥ 0.98**. The 0.98 validation
+floor is deliberately stricter than the 0.97 target so the unseen test set keeps
+a buffer. The chosen threshold, rules flag, barrier, achieved precision, and
+`precision_target_met` land in `models/*_meta.json` and are applied automatically
+at inference. If the floor is unreachable on validation, training warns and
+returns the highest-precision config — check the `[precision]` lines in the log.
+To set the exact 0.97 floor use `TARGET_PRECISION=0.97`; to disable entirely use
+`TARGET_PRECISION= bash scripts/train_vm.sh`.
 
 Blocking now also runs a **BM25 word-n-gram recall pass** (`BM25Index`) unioned
 with the inverted-index blocks. Disable it with `ER_USE_BM25=0` to reproduce the

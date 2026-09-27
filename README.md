@@ -225,6 +225,7 @@ The model improvements are opt-in so the validated E3 baseline stays reproducibl
 | `--workers N` | — | Process pool size for normalize/blocking/features/sweeps (default: CPU count) |
 | `--neg-ratio K` | — | Train: cap easy negatives at K per positive (bounds memory) |
 | `--min-precision P` | — | Train: pick the threshold meeting pair-precision ≥ P (precision-first), e.g. `0.99` |
+| `--target-precision P` | E9 | Train: maximize macro F0.5 subject to validation pair precision ≥ P, jointly over threshold + conservative rules + singleton barrier, e.g. `0.97` |
 | `--force-rules` | — | Train: always reject high-name / no-address risky pairs |
 
 ### Precision-first tuning (F0.5 weights precision 2×)
@@ -237,6 +238,31 @@ python -m src.pipeline --mode train --sample 100000 --max-candidates 50 \
 at least P (falling back to the most precise threshold if none qualifies).
 `--force-rules` additionally hard-rejects near-identical-name pairs with zero
 address/postal evidence — the classic false-merge pattern.
+
+### Precision floor (E9): `--target-precision`
+`--min-precision` tunes only the threshold. `--target-precision P` tunes the
+**whole decision configuration** — threshold × conservative rules × singleton
+barrier — to maximize macro F0.5 subject to validation pair precision ≥ P. The
+barrier sweep is constrained too, so no guard can silently drop precision below
+the floor. The achieved precision and whether the floor was met are written to
+`models/*_meta.json` (`val_pair_precision`, `precision_target_met`). If the floor
+is unreachable on validation, training says so loudly and returns the
+highest-precision configuration instead of pretending success.
+
+```bash
+# require 97% pair precision, then maximize F0.5 under that constraint
+python -m src.pipeline --mode train --target-precision 0.97
+
+# stricter validation floor (0.98) for a buffer above 0.97 on the unseen test set
+python -m src.pipeline --mode train --target-precision 0.98
+```
+
+> Pair precision here is measured over non-singleton S1 entities (as the official
+> metric aggregates). Singleton protection is handled separately by the barrier,
+> which the selector also constrains to respect the precision floor. A target that
+> is unreachable on validation is reported (`precision_target_met: false`) rather
+> than silently accepted, and an all-empty prediction set is never counted as
+> meeting the floor.
 
 ### Running on multi-core local hardware
 The pipeline scales process pools to the CPU count (`ER_WORKERS` env or `--workers`

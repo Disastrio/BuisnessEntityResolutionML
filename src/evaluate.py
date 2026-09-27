@@ -562,6 +562,219 @@ def threshold_sweep_for_precision(
     return best_feasible[0], best_feasible[1], results
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# Precision-constrained configuration selection
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _precision_context(
+    s1_ids: List[str],
+    target_ids: List[str],
+    probabilities: np.ndarray,
+    ground_truth: Dict[str, Set[str]],
+    reject_mask: Optional[np.ndarray] = None,
+) -> dict:
+    """
+    Precompute the arrays needed to score pair precision/recall at any
+    (threshold, barrier) without re-scanning the ground truth each time.
+
+    Semantics match `_pair_pr` exactly:
+      * singleton S1 entities are excluded from pair P/R,
+      * rejected pairs are never predicted,
+      * the recall denominator counts true positives of non-singleton entities
+        regardless of rejection (a rejected true pair is a false negative).
+    """
+    probs = np.asarray(probabilities, dtype=np.float64)
+    n = len(probs)
+    singleton = {s for s, v in ground_truth.items() if not v}
+    is_pos = np.fromiter(
+        (t in ground_truth.get(s, ()) for s, t in zip(s1_ids, target_ids)),
+        dtype=bool, count=n)
+    non_sing = np.fromiter(
+        (s not in singleton for s in s1_ids), dtype=bool, count=n)
+    rejected = (np.asarray(reject_mask, dtype=bool) if reject_mask is not None
+                else np.zeros(n, dtype=bool))
+    eligible = non_sing & ~rejected
+    pos_total = int((non_sing & is_pos).sum())
+    if n:
+        _, inv = np.unique(np.asarray(s1_ids, dtype=object), return_inverse=True)
+        n_ent = int(inv.max()) + 1 if inv.size else 0
+    else:
+        inv = np.empty(0, dtype=np.int64)
+        n_ent = 0
+    return {
+        'probs': probs, 'is_pos': is_pos, 'eligible': eligible,
+        'pos_total': pos_total, 'inv': inv, 'n_ent': n_ent,
+    }
+
+
+def _pair_counts_at(ctx: dict, threshold: float, barrier: float = 0.0) -> Tuple[int, int, int]:
+    """(tp, fp, fn) at one (threshold, barrier) from a context dict."""
+    probs = ctx['probs']
+    accepted = ctx['eligible'] & (probs >= float(threshold))
+    if barrier and barrier > 0.0 and accepted.any():
+        idx = np.flatnonzero(accepted)
+        best = np.full(ctx['n_ent'], -1.0, dtype=np.float64)
+        np.maximum.at(best, ctx['inv'][idx], probs[idx])
+        accepted[idx] = best[ctx['inv'][idx]] >= float(barrier)
+    acc = np.flatnonzero(accepted)
+    tp = int(ctx['is_pos'][acc].sum())
+    fp = int(acc.size - tp)
+    fn = int(ctx['pos_total'] - tp)
+    return tp, fp, fn
+
+
+def _pair_pr_at(ctx: dict, threshold: float, barrier: float = 0.0) -> Tuple[float, float]:
+    """Pair precision/recall at one (threshold, barrier) from a context dict."""
+    tp, fp, fn = _pair_counts_at(ctx, threshold, barrier)
+    precision = tp / (tp + fp) if (tp + fp) else 1.0
+    recall = tp / (tp + fn) if (tp + fn) else 0.0
+    return precision, recall
+
+
+def _pick_precision_config(rows: List[dict], target: float, tol: float) -> Tuple[dict, bool]:
+    """
+    Pick the max-macro-F0.5 row whose pair precision clears `target` AND which
+    actually predicts something. An empty prediction set has precision 1.0 but
+    zero recall, so it must never be treated as "meeting" the precision floor.
+    """
+    feasible = [r for r in rows
+                if r['pair_precision'] >= target - tol and r.get('pair_predicted', 1) > 0]
+    if feasible:
+        return max(feasible, key=lambda r: (r['macro_fbeta'], r['pair_precision'])), True
+    nonempty = [r for r in rows if r.get('pair_predicted', 1) > 0]
+    pool = nonempty if nonempty else rows
+    return max(pool, key=lambda r: (r['pair_precision'], r['macro_fbeta'])), False
+
+
+def threshold_sweep_with_precision(
+    s1_ids: List[str],
+    target_ids: List[str],
+    probabilities: np.ndarray,
+    ground_truth: Dict[str, Set[str]],
+    thresholds: Optional[List[float]] = None,
+    beta: float = BETA,
+    reject_mask: Optional[np.ndarray] = None,
+    barrier: float = 0.0,
+    n_workers: int = 1,
+) -> Tuple[float, float, List[dict]]:
+    """
+    Like `threshold_sweep`, but every row also carries exact pair precision and
+    recall (computed vectorized, so adding them is nearly free).
+
+    Returns (best_threshold, best_macro_fbeta, rows) where each row is
+    {'threshold', 'macro_fbeta', 'pair_precision', 'pair_recall'}.
+    """
+    if thresholds is None:
+        thresholds = [round(t, 2) for t in np.arange(0.30, 1.0, 0.01)]
+    thresholds = [float(t) for t in thresholds]
+
+    best_t, best_score, sweep = threshold_sweep(
+        s1_ids, target_ids, probabilities, ground_truth,
+        thresholds=thresholds, beta=beta, reject_mask=reject_mask,
+        barrier=barrier, n_workers=n_workers)
+    ctx = _precision_context(s1_ids, target_ids, probabilities, ground_truth,
+                             reject_mask=reject_mask)
+    for row in sweep:
+        tp, fp, fn = _pair_counts_at(ctx, row['threshold'], barrier)
+        row['pair_precision'] = round(tp / (tp + fp) if (tp + fp) else 1.0, 6)
+        row['pair_recall'] = round(tp / (tp + fn) if (tp + fn) else 0.0, 6)
+        row['pair_predicted'] = tp + fp
+    return best_t, best_score, sweep
+
+
+def select_precision_constrained_config(
+    s1_ids: List[str],
+    target_ids: List[str],
+    probabilities: np.ndarray,
+    ground_truth: Dict[str, Set[str]],
+    target_precision: float = 0.97,
+    reject_options: Optional[Dict[str, Optional[np.ndarray]]] = None,
+    thresholds: Optional[List[float]] = None,
+    barriers: Optional[List[float]] = None,
+    beta: float = BETA,
+    n_workers: int = 1,
+) -> dict:
+    """
+    Choose the decision configuration that MAXIMISES macro F0.5 subject to
+    validation pair precision >= `target_precision`.
+
+    Searches, in order:
+      1. threshold (global), for each conservative-rule option;
+      2. the best feasible (threshold, rules) pair by macro F0.5;
+      3. the singleton barrier, again restricted to feasible precision.
+
+    Returns a dict with the chosen threshold/rules/barrier, the achieved
+    validation precision/recall/macro F0.5, whether the target was met, and the
+    full candidate diagnostics. When the target is unreachable it returns the
+    highest-precision configuration and `target_met=False` (never silently
+    claims success).
+    """
+    if reject_options is None:
+        reject_options = {'none': None}
+    if thresholds is None:
+        thresholds = [round(t, 2) for t in np.arange(0.30, 1.0, 0.01)]
+    thresholds = [float(t) for t in thresholds]
+    tol = 1e-9
+
+    candidates: List[dict] = []
+    for name, mask in reject_options.items():
+        _, _, sweep = threshold_sweep_with_precision(
+            s1_ids, target_ids, probabilities, ground_truth,
+            thresholds=thresholds, beta=beta, reject_mask=mask,
+            n_workers=n_workers)
+        best, feasible = _pick_precision_config(sweep, target_precision, tol)
+        candidates.append({
+            'reject': name, 'mask': mask, 'threshold': best['threshold'],
+            'macro_fbeta': best['macro_fbeta'],
+            'pair_precision': best['pair_precision'],
+            'pair_recall': best['pair_recall'],
+            'pair_predicted': best.get('pair_predicted', 0),
+            'feasible': feasible,
+        })
+
+    feasible_cands = [c for c in candidates if c['feasible']]
+    if feasible_cands:
+        chosen = max(feasible_cands, key=lambda c: (c['macro_fbeta'], c['pair_precision']))
+    else:
+        chosen = max(candidates, key=lambda c: (c['pair_precision'], c['macro_fbeta']))
+
+    # Barrier sweep at the chosen threshold/rules, restricted to feasible precision.
+    if barriers is None:
+        barriers = [0.0] + [round(b, 2) for b in np.arange(0.50, 0.99, 0.02)]
+    barriers = [float(b) for b in barriers]
+    _, _, bar_sweep = sweep_singleton_barrier(
+        s1_ids, target_ids, probabilities, ground_truth,
+        threshold=chosen['threshold'], reject_mask=chosen['mask'],
+        barriers=barriers, beta=beta, n_workers=n_workers)
+    ctx = _precision_context(s1_ids, target_ids, probabilities, ground_truth,
+                             reject_mask=chosen['mask'])
+    bar_rows: List[dict] = []
+    for row in bar_sweep:
+        tp, fp, fn = _pair_counts_at(ctx, chosen['threshold'], row['barrier'])
+        bar_rows.append({
+            'barrier': row['barrier'], 'macro_fbeta': row['macro_fbeta'],
+            'pair_precision': round(tp / (tp + fp) if (tp + fp) else 1.0, 6),
+            'pair_recall': round(tp / (tp + fn) if (tp + fn) else 0.0, 6),
+            'pair_predicted': tp + fp,
+        })
+    best_bar, met = _pick_precision_config(bar_rows, target_precision, tol)
+
+    return {
+        'threshold': float(chosen['threshold']),
+        'thresholds_by_source': None,
+        'reject': chosen['reject'],
+        'reject_mask': chosen['mask'],
+        'barrier': float(best_bar['barrier']),
+        'macro_fbeta': float(best_bar['macro_fbeta']),
+        'pair_precision': float(best_bar['pair_precision']),
+        'pair_recall': float(best_bar['pair_recall']),
+        'target_precision': float(target_precision),
+        'target_met': bool(met),
+        'threshold_candidates': candidates,
+        'barrier_sweep': bar_rows,
+    }
+
+
 def apply_threshold(
     s1_ids: List[str],
     target_ids: List[str],

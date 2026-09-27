@@ -38,6 +38,11 @@ WORKERS="${WORKERS:-$CORES}"
 MAX_CANDIDATES="${MAX_CANDIDATES:-$AUTO_MAXCAND}"
 NEG_RATIO="${NEG_RATIO:-$AUTO_NEGRATIO}"
 SAMPLE="${SAMPLE:-}"
+# Pair-precision floor: maximise macro F0.5 subject to validation pair precision
+# >= this. Default 0.98 leaves a buffer so the unseen test pair precision stays
+# above the 0.97 requirement. Set TARGET_PRECISION= (empty) to fall back to the
+# F0.5-only sweep, or TARGET_PRECISION=0.97 for the exact floor.
+TARGET_PRECISION="${TARGET_PRECISION-0.98}"
 
 export PYTHONIOENCODING=utf-8
 export ER_WORKERS="$WORKERS"
@@ -53,7 +58,12 @@ fi
 mkdir -p reports models
 LOG="reports/train_$(date +%Y%m%d_%H%M%S).log"
 
-ARGS=(--mode train --workers "$WORKERS" --max-candidates "$MAX_CANDIDATES" --neg-ratio "$NEG_RATIO" --source-thresholds)
+ARGS=(--mode train --workers "$WORKERS" --max-candidates "$MAX_CANDIDATES" --neg-ratio "$NEG_RATIO")
+if [ -n "$TARGET_PRECISION" ]; then
+    ARGS+=(--target-precision "$TARGET_PRECISION")
+else
+    ARGS+=(--source-thresholds)
+fi
 if [ -n "$SAMPLE" ]; then
     ARGS+=(--sample "$SAMPLE")
 fi
@@ -66,6 +76,7 @@ echo "   workers        : $WORKERS"
 echo "   lgbm device    : $DEVICE_NOTE"
 echo "   max_candidates : $MAX_CANDIDATES"
 echo "   neg_ratio      : $NEG_RATIO"
+echo "   target_prec    : ${TARGET_PRECISION:-<none: pure F0.5 sweep>}"
 echo "   sample         : ${SAMPLE:-<full dataset>}"
 echo "   log            : $LOG"
 echo "=============================================================="

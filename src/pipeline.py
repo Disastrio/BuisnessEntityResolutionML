@@ -56,6 +56,7 @@ from src.train import (
 from src.evaluate import (
     detailed_evaluation, threshold_sweep, threshold_sweep_for_precision,
     assemble_predictions, threshold_sweep_by_source, sweep_singleton_barrier,
+    select_precision_constrained_config,
 )
 from src.predict import (
     predict_probabilities, run_chunked_inference, conservative_reject_mask,
@@ -91,6 +92,7 @@ def run_training(
     neg_ratio: Optional[float] = None,
     min_precision: Optional[float] = None,
     force_rules: bool = False,
+    target_precision: Optional[float] = None,
 ):
     """
     Full training pipeline:
@@ -282,69 +284,116 @@ def run_training(
     # Build val ground truth (only S1 entities in validation set)
     val_gt = {s1_id: gt.get(s1_id, set()) for s1_id in val_s1_set}
 
-    # E7: conservative rules (kept only when they improve validation F0.5)
-    val_reject = None
-    use_rules = False
-    if USE_CONSERVATIVE_RULES:
-        candidate_reject = conservative_reject_mask(X_val)
-        if force_rules:
-            val_reject = candidate_reject
-            use_rules = True
-            print(f"  [E7] Conservative rules FORCED on "
-                  f"({int(candidate_reject.sum()):,} risky pairs rejected)")
+    effective_target = target_precision if target_precision is not None else min_precision
+    precision_met: Optional[bool] = None
+
+    if effective_target is not None:
+        # ── E9: precision-constrained selection ──────────────────────────────
+        # Maximise macro F0.5 subject to validation pair precision >= target,
+        # jointly over threshold, conservative rules, and the singleton barrier.
+        if USE_CONSERVATIVE_RULES:
+            candidate_reject = conservative_reject_mask(X_val)
+            reject_options = ({'rules': candidate_reject} if force_rules
+                              else {'none': None, 'rules': candidate_reject})
         else:
-            _, score_without, _ = threshold_sweep(
-                s1_val, t_val, val_probs, val_gt, n_workers=FEATURE_WORKERS)
-            _, score_with, _ = threshold_sweep(
-                s1_val, t_val, val_probs, val_gt, reject_mask=candidate_reject,
-                n_workers=FEATURE_WORKERS)
-            if score_with > score_without + 1e-9:
+            reject_options = {'none': None}
+
+        print(f"  [precision] searching threshold/rules/barrier for "
+              f"pair precision >= {effective_target} ...")
+        selection = select_precision_constrained_config(
+            s1_val, t_val, val_probs, val_gt,
+            target_precision=float(effective_target),
+            reject_options=reject_options,
+            n_workers=FEATURE_WORKERS,
+        )
+        best_thresh = selection['threshold']
+        thresholds_by_source = None
+        val_reject = selection['reject_mask']
+        use_rules = selection['reject'] == 'rules'
+        barrier = selection['barrier']
+        best_score = selection['macro_fbeta']
+        precision_met = selection['target_met']
+        if precision_met:
+            print(f"  [precision] TARGET MET: pair precision "
+                  f"{selection['pair_precision']} >= {effective_target} "
+                  f"(t={best_thresh}, rules={use_rules}, barrier={barrier}, "
+                  f"recall={selection['pair_recall']}, F0.5={best_score:.6f})")
+        else:
+            print(f"  [precision][WARN] target {effective_target} NOT reachable "
+                  f"on validation; best pair precision = "
+                  f"{selection['pair_precision']} (t={best_thresh}, "
+                  f"rules={use_rules}, barrier={barrier}). "
+                  f"Try --force-rules or a higher --max-candidates.")
+        for cand in selection['threshold_candidates']:
+            print(f"    rules={cand['reject']:<5} t={cand['threshold']:.2f} "
+                  f"P={cand['pair_precision']} R={cand['pair_recall']} "
+                  f"F0.5={cand['macro_fbeta']} feasible={cand['feasible']}")
+        print(f"  Best threshold: {best_thresh}")
+        print(f"  Best macro F0.5: {best_score:.6f}")
+    else:
+        # E7: conservative rules (kept only when they improve validation F0.5)
+        val_reject = None
+        use_rules = False
+        if USE_CONSERVATIVE_RULES:
+            candidate_reject = conservative_reject_mask(X_val)
+            if force_rules:
                 val_reject = candidate_reject
                 use_rules = True
-                print(f"  [E7] Conservative rules KEPT "
-                      f"({score_with:.6f} > {score_without:.6f})")
+                print(f"  [E7] Conservative rules FORCED on "
+                      f"({int(candidate_reject.sum()):,} risky pairs rejected)")
             else:
-                print(f"  [E7] Conservative rules rejected "
-                      f"({score_with:.6f} <= {score_without:.6f})")
+                _, score_without, _ = threshold_sweep(
+                    s1_val, t_val, val_probs, val_gt, n_workers=FEATURE_WORKERS)
+                _, score_with, _ = threshold_sweep(
+                    s1_val, t_val, val_probs, val_gt, reject_mask=candidate_reject,
+                    n_workers=FEATURE_WORKERS)
+                if score_with > score_without + 1e-9:
+                    val_reject = candidate_reject
+                    use_rules = True
+                    print(f"  [E7] Conservative rules KEPT "
+                          f"({score_with:.6f} > {score_without:.6f})")
+                else:
+                    print(f"  [E7] Conservative rules rejected "
+                          f"({score_with:.6f} <= {score_without:.6f})")
 
-    # E5: per-source thresholds vs a single global threshold
-    thresholds_by_source = None
-    if USE_SOURCE_THRESHOLDS:
-        thresholds_by_source, best_score, _ = threshold_sweep_by_source(
-            s1_val, t_val, val_probs, val_gt, reject_mask=val_reject)
-        best_thresh = max(thresholds_by_source.values())
-        print(f"  [E5] Per-source thresholds: {thresholds_by_source}")
-    else:
-        if min_precision is not None:
-            best_thresh, best_score, sweep = threshold_sweep_for_precision(
-                s1_val, t_val, val_probs, val_gt, min_precision=min_precision,
-                reject_mask=val_reject)
-            chosen = next((r for r in sweep if r['threshold'] == best_thresh), None)
-            if chosen:
-                print(f"  [precision-first] target P>={min_precision}: "
-                      f"t={best_thresh} P={chosen['pair_precision']} "
-                      f"R={chosen['pair_recall']} F0.5={chosen['macro_fbeta']}")
+        # E5: per-source thresholds vs a single global threshold
+        thresholds_by_source = None
+        if USE_SOURCE_THRESHOLDS:
+            thresholds_by_source, best_score, _ = threshold_sweep_by_source(
+                s1_val, t_val, val_probs, val_gt, reject_mask=val_reject)
+            best_thresh = max(thresholds_by_source.values())
+            print(f"  [E5] Per-source thresholds: {thresholds_by_source}")
         else:
-            best_thresh, best_score, sweep = threshold_sweep(
-                s1_val, t_val, val_probs, val_gt, reject_mask=val_reject,
-                n_workers=FEATURE_WORKERS)
-    print(f"  Best threshold: {best_thresh}")
-    print(f"  Best macro F0.5: {best_score:.6f}")
+            if min_precision is not None:
+                best_thresh, best_score, sweep = threshold_sweep_for_precision(
+                    s1_val, t_val, val_probs, val_gt, min_precision=min_precision,
+                    reject_mask=val_reject)
+                chosen = next((r for r in sweep if r['threshold'] == best_thresh), None)
+                if chosen:
+                    print(f"  [precision-first] target P>={min_precision}: "
+                          f"t={best_thresh} P={chosen['pair_precision']} "
+                          f"R={chosen['pair_recall']} F0.5={chosen['macro_fbeta']}")
+            else:
+                best_thresh, best_score, sweep = threshold_sweep(
+                    s1_val, t_val, val_probs, val_gt, reject_mask=val_reject,
+                    n_workers=FEATURE_WORKERS)
+        print(f"  Best threshold: {best_thresh}")
+        print(f"  Best macro F0.5: {best_score:.6f}")
 
-    # E8: singleton confidence barrier (tuned; only improves the score)
-    tuned_barrier, barrier_score, _ = sweep_singleton_barrier(
-        s1_val, t_val, val_probs, val_gt,
-        threshold=None if thresholds_by_source else best_thresh,
-        thresholds_by_source=thresholds_by_source,
-        reject_mask=val_reject,
-        n_workers=FEATURE_WORKERS,
-    )
-    if tuned_barrier > 0:
-        print(f"  [E8] Singleton barrier adopted: {tuned_barrier} "
-              f"(F0.5 {barrier_score:.6f})")
-        barrier = tuned_barrier
-    else:
-        barrier = SINGLETON_BARRIER
+        # E8: singleton confidence barrier (tuned; only improves the score)
+        tuned_barrier, barrier_score, _ = sweep_singleton_barrier(
+            s1_val, t_val, val_probs, val_gt,
+            threshold=None if thresholds_by_source else best_thresh,
+            thresholds_by_source=thresholds_by_source,
+            reject_mask=val_reject,
+            n_workers=FEATURE_WORKERS,
+        )
+        if tuned_barrier > 0:
+            print(f"  [E8] Singleton barrier adopted: {tuned_barrier} "
+                  f"(F0.5 {barrier_score:.6f})")
+            barrier = tuned_barrier
+        else:
+            barrier = SINGLETON_BARRIER
 
     # Detailed evaluation at the final tuned configuration
     val_preds = assemble_predictions(
@@ -381,6 +430,8 @@ def run_training(
         'max_candidates': max_candidates,
         'neg_ratio': neg_ratio,
         'min_precision': min_precision,
+        'target_precision': effective_target,
+        'precision_target_met': precision_met,
         'forced_rules': force_rules,
         'tuned_macro_f05': best_score,
     }
@@ -629,6 +680,11 @@ def main():
              '(precision-first tuning), e.g. 0.99'
     )
     parser.add_argument(
+        '--target-precision', type=float, default=None,
+        help='Train: maximise macro F0.5 subject to validation pair precision '
+             '>= this value, jointly over threshold/rules/barrier, e.g. 0.97'
+    )
+    parser.add_argument(
         '--force-rules', action='store_true',
         help='Train: always apply conservative rules (reject high-name / '
              'no-address risky pairs)'
@@ -656,6 +712,7 @@ def main():
         neg_ratio=args.neg_ratio,
         min_precision=args.min_precision,
         force_rules=args.force_rules,
+        target_precision=args.target_precision,
     )
 
     if args.mode == 'smoke':

@@ -43,7 +43,9 @@ from src.train import (
 from src.evaluate import (
     infer_source, assemble_predictions, threshold_sweep,
     threshold_sweep_by_source, sweep_singleton_barrier, macro_fbeta,
-    threshold_sweep_for_precision,
+    threshold_sweep_for_precision, threshold_sweep_with_precision,
+    select_precision_constrained_config,
+    _pair_pr, _pair_pr_at, _precision_context,
 )
 from src.predict import (
     conservative_reject_mask, assemble_matches,
@@ -767,6 +769,76 @@ def test_precision_targeting():
           f"t={t} P={chosen['pair_precision']} F={score}")
 
 
+def test_precision_constrained_selection():
+    print("\n[15b] Precision-constrained configuration selection")
+    s1 = ["S1-1", "S1-1", "S1-1", "S1-2", "S1-2", "S1-3"]
+    tgt = ["S2-1", "S2-2", "S3-1", "S2-3", "S2-4", "S3-2"]
+    probs = np.array([0.99, 0.95, 0.90, 0.80, 0.30, 0.70])
+    gt = {"S1-1": {"S2-1", "S3-1"}, "S1-2": {"S2-3"}, "S1-3": set()}
+    all_s1 = set(gt.keys())
+
+    # Exactness: vectorized _pair_pr_at must equal _pair_pr across threshold /
+    # reject / barrier combinations.
+    mask = np.array([False, True, False, False, False, False])
+    exact = True
+    for t in (0.30, 0.50, 0.90, 0.96, 0.99):
+        for rej in (None, mask):
+            for b in (0.0, 0.85):
+                preds = assemble_predictions(
+                    s1, tgt, probs, threshold=t, all_s1_ids=all_s1,
+                    barrier=b, reject_mask=rej)
+                ref = _pair_pr(gt, preds)
+                ctx = _precision_context(s1, tgt, probs, gt, reject_mask=rej)
+                got = _pair_pr_at(ctx, t, b)
+                if not (abs(ref[0] - got[0]) < 1e-9 and abs(ref[1] - got[1]) < 1e-9):
+                    exact = False
+                    print(f"    mismatch t={t} rej={rej is not None} b={b}: "
+                          f"ref={ref} got={got}")
+    check("vectorized pair P/R == _pair_pr (all combos)", exact)
+
+    sel = select_precision_constrained_config(
+        s1, tgt, probs, gt, target_precision=0.97,
+        thresholds=[0.5, 0.9, 0.96, 0.99],
+        barriers=[0.0, 0.85, 0.98])
+    check("precision target met", sel["target_met"] is True,
+          f"{sel['pair_precision']}")
+    check("achieved precision >= target",
+          sel["pair_precision"] >= 0.97, f"{sel['pair_precision']}")
+    check("chosen barrier keeps precision feasible",
+          sel["pair_precision"] >= 0.97, f"barrier={sel['barrier']}")
+
+    # Barrier must never be allowed to break the precision floor: at a low
+    # threshold precision is bad, so the selector must pick a high threshold.
+    check("selector rejects low-precision threshold",
+          sel["threshold"] >= 0.96, f"t={sel['threshold']}")
+
+    # Infeasible target -> reported honestly, returns max-precision config.
+    sel2 = select_precision_constrained_config(
+        s1, tgt, probs, gt, target_precision=1.01,
+        thresholds=[0.5, 0.9, 0.96, 0.99], barriers=[0.0, 0.85])
+    check("infeasible target reported, not claimed",
+          sel2["target_met"] is False and sel2["pair_precision"] <= 1.0,
+          f"{sel2['pair_precision']}")
+
+    # Empty-prediction guard: precision is 1.0 when nothing is predicted, but a
+    # config that predicts nothing must NOT be treated as meeting the floor.
+    s1e = ["S1-1", "S1-1"]
+    tgte = ["S2-1", "S2-2"]
+    probe = np.array([0.40, 0.90])
+    gte = {"S1-1": {"S2-1"}}
+    sel3 = select_precision_constrained_config(
+        s1e, tgte, probe, gte, target_precision=0.97,
+        thresholds=[0.35, 0.50, 0.95], barriers=[0.0])
+    check("empty predictions not counted as precision floor",
+          sel3["target_met"] is False, f"{sel3['pair_precision']}")
+
+    # threshold_sweep_with_precision exposes precision/recall per threshold.
+    _, _, rows = threshold_sweep_with_precision(
+        s1, tgt, probs, gt, thresholds=[0.5, 0.96])
+    check("sweep rows carry pair precision/recall",
+          all("pair_precision" in r and "pair_recall" in r for r in rows))
+
+
 def test_dynamic_thresholds():
     print("\n[16] Dynamic tiered thresholds")
     from src.evaluate import dynamic_threshold_array
@@ -842,6 +914,7 @@ def main():
     test_normalize_equivalence()
     test_normalization_fixes()
     test_precision_targeting()
+    test_precision_constrained_selection()
     test_dynamic_thresholds()
     test_competitive_assignment()
 

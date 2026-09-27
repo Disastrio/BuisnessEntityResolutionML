@@ -189,6 +189,7 @@ All computed in `src/features.py` for each candidate pair $(S_1, S_{2/3})$:
 | **E8** | Phonetic Blocking Index 6 (Soundex) | — | — | — | — | ✅ Implemented | 7th block now actually built |
 | **E9** | Recall Fixes: single-numeric + address-token indexes + round-robin cap | 98.5% | 0.990 | 0.963 | **0.982** | ✅ Implemented | Candidate recall 0.879 → 0.985; see `scripts/diagnose_blocking.py` |
 | **E10** | BM25 word-n-gram blocking pass (`BM25Index`, Okapi k1=1.5 b=0.75) | — | — | — | — | ✅ Implemented | Unioned into blocking; measure with `scripts/sparse_sweep.py`; `ER_USE_BM25=0` disables |
+| **E11** | Precision-constrained selection (`--target-precision`) | — | ≥ target | — | max s.t. P | ✅ Implemented | Jointly tunes threshold × rules × barrier to maximize macro F0.5 s.t. validation pair precision ≥ target; `select_precision_constrained_config` in `src/evaluate.py` |
 
 ---
 
