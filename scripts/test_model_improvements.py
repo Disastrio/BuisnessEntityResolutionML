@@ -370,6 +370,44 @@ def test_blocking_recall_fixes():
     check("exact-name candidate always kept", "EXACTMATCH" in ranked2)
 
 
+def test_bm25_block():
+    print("\n[7b] BM25 recall pass")
+    s2 = restrict_to_core_columns(normalize_dataframe(pd.DataFrame([
+        raw("acme corporation", "1 main st 11111", "US"),
+        raw("globex corporation", "2 oak ave 22222", "US"),
+    ]).assign(entity_id=["S2-1", "S2-2"]), "S2"))
+    s3 = restrict_to_core_columns(normalize_dataframe(pd.DataFrame([
+        raw("umbrella health", "3 pine rd 33333", "US"),
+    ]).assign(entity_id=["S3-1"]), "S3"))
+    s1 = restrict_to_core_columns(normalize_dataframe(pd.DataFrame([
+        raw("acme corporation", "1 main st 11111", "US"),
+    ]).assign(entity_id=["S1-1"]), "S1"))
+
+    bundle = build_all_indices(s2, s3)
+    check("BM25 index built into bundle", bundle.get("bm25_s2") is not None)
+    ids, sc = bundle["bm25_s2"].query_topn("acme corporation", 5)
+    check("BM25 retrieves exact-name candidate", "S2-1" in ids, f"{ids}")
+    check("BM25 scores descending", len(sc) <= 1 or sc[0] >= sc[-1])
+
+    cands = generate_candidates_from_bundle(s1, bundle, show_progress=False)
+    check("BM25 pass keeps true candidate", "S2-1" in cands["S1-1"],
+          f"{cands['S1-1']}")
+    cands2 = generate_candidates_from_bundle(s1, bundle, show_progress=False)
+    check("BM25 candidate gen deterministic", cands == cands2)
+    if hasattr(os, "fork"):
+        par = _generate_candidates_parallel(s1, bundle, 100, 2)
+        check("BM25 parallel == serial", par == cands, f"{par} vs {cands}")
+
+    import src.blocking as _blocking
+    old_flag = _blocking.USE_BM25_BLOCK
+    _blocking.USE_BM25_BLOCK = False
+    try:
+        off = build_all_indices(s2, s3)
+        check("BM25 disabled -> no index", off.get("bm25_s2") is None)
+    finally:
+        _blocking.USE_BM25_BLOCK = old_flag
+
+
 def test_chunked_inference():
     print("\n[8] Chunked streaming inference")
     s1 = restrict_to_core_columns(normalize_dataframe(pd.DataFrame([
@@ -795,6 +833,7 @@ def main():
     test_dual_models()
     test_blocking_and_output()
     test_blocking_recall_fixes()
+    test_bm25_block()
     test_chunked_inference()
     test_parallel_features()
     test_parallel_sweeps()

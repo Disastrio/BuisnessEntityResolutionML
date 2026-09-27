@@ -139,6 +139,17 @@ SOUNDEX_LENGTH          = 4
 # Blocking: distinctive name-trigram index (typo/transliteration recall).
 USE_TRIGRAM_BLOCK       = True
 
+# Blocking: Okapi BM25 top-N pass over word n-grams (recall booster). Complements
+# the prefix/soundex/trigram blocks by rewarding distinctive shared name tokens.
+# Disable with the ER_USE_BM25=0 environment variable.
+USE_BM25_BLOCK          = os.environ.get('ER_USE_BM25', '1') != '0'
+BM25_K1                 = 1.5
+BM25_B                  = 0.75
+BM25_NGRAM_MAX          = 2       # word unigrams + bigrams
+BM25_MIN_DF             = 2
+BM25_MAX_FEATURES       = 500_000
+BM25_MAX_POST           = 2000    # postings pulled per query term
+
 # Blocking: MinHash-LSH Forest over name character shingles (typo/reorder recall).
 # Measured on a 20k sample: no recall gain over trigram/exact blocks and slower
 # index build, so disabled in favour of sparse-dot top-N retrieval.

@@ -155,6 +155,11 @@ The RAM→`(max-candidates, neg-ratio)` mapping is
 `≥128 GB → (100, 10)`, `≥64 GB → (80, 6)`, else `(50, 4)`. Every value is an env
 override, so you can dial it without editing scripts.
 
+Blocking now also runs a **BM25 word-n-gram recall pass** (`BM25Index`) unioned
+with the inverted-index blocks. Disable it with `ER_USE_BM25=0` to reproduce the
+previous blocking behavior; quantify its candidate-recall contribution with
+`python scripts/sparse_sweep.py 20000` (prints SPARSE / BM25 / UNION recall).
+
 Outputs: a timestamped log in `reports/`, and `models/lgbm_pair_classifier*` plus
 its `*_meta.json` (validation F0.5, chosen threshold, per-source thresholds, barrier).
 

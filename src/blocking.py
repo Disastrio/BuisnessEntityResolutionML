@@ -1,5 +1,5 @@
 """
-blocking.py — Multi-Pass Candidate Generation (7-Tier Inverted Index Union).
+blocking.py — Multi-Pass Candidate Generation (8-Tier Inverted Index Union).
 
 Sets the RECALL CEILING for the entire pipeline. Uses union of multiple
 blocking strategies to maximize candidate recall while keeping candidate
@@ -13,6 +13,7 @@ Blocking Strategies:
     Index 5: Shared numerics + country (addr numbers + country)
     Index 6: Soundex / phonetic prefix of the leading name token
     Index 7: Relaxed — first 4 chars of name + country (catch-all)
+    Index 8: BM25 word-n-gram top-N over names (`BM25Index`) — recall boost
 
 Candidates are accumulated in index-reliability order and truncated at
 MAX_CANDIDATES, so the retained set is deterministic (stable across runs and
@@ -36,7 +37,10 @@ from src.config import (
     MAX_CANDIDATES, ID_COL, USE_PHONETIC_BLOCK, SOUNDEX_LENGTH, BLOCK_FETCH_CAP,
     USE_TRIGRAM_BLOCK, MAX_BUCKET_IDS,
     USE_MINHASH_LSH, MINHASH_K, MINHASH_BANDS, MINHASH_ROWS, MINHASH_SHINGLE,
+    USE_BM25_BLOCK, BM25_K1, BM25_B, BM25_NGRAM_MAX, BM25_MIN_DF,
+    BM25_MAX_FEATURES, BM25_MAX_POST,
 )
+from src.sparse_retrieval import BM25Index
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -457,7 +461,8 @@ def _s1_components(name: str, country: str, postal: str, nums: str,
 
 def _candidates_from_components(comp: dict, indices, rare_tokens,
                                 rare_addr_tokens, rare_trigrams,
-                                max_candidates: int) -> List[str]:
+                                max_candidates: int,
+                                bm25_index=None) -> List[str]:
     """Query S2 or S3 indices for one S1 record using its precomputed components."""
     country = comp['country']
 
@@ -529,6 +534,12 @@ def _candidates_from_components(comp: dict, indices, rare_tokens,
         block_lists.append(addr_ids)
     else:
         block_lists.append([])
+    if bm25_index is not None and comp['name']:
+        bm25_ids, _ = bm25_index.query_topn(
+            comp['name'], max_candidates, max_post=BM25_MAX_POST)
+        block_lists.append(bm25_ids)
+    else:
+        block_lists.append([])
     block_lists.append(
         fetch('relaxed_name', f"{country}|rel|{cname[:4]}") if len(cname) >= 3 else [])
 
@@ -557,6 +568,7 @@ def _ranked_candidates_for_s1(
     rare_addr_tokens: Optional[Set[str]] = None,
     rare_trigrams: Optional[Set[str]] = None,
     max_candidates: int = MAX_CANDIDATES,
+    bm25_index=None,
 ) -> List[str]:
     """Single-record wrapper (kept for callers/tests)."""
     comp = _s1_components(
@@ -564,7 +576,8 @@ def _ranked_candidates_for_s1(
         str(s1_row.get('addr_postal', '')), str(s1_row.get('addr_numeric', '')),
         str(s1_row.get('name_tokens', '')), str(s1_row.get('addr_clean', '')))
     return _candidates_from_components(
-        comp, indices, rare_tokens, rare_addr_tokens, rare_trigrams, max_candidates)
+        comp, indices, rare_tokens, rare_addr_tokens, rare_trigrams, max_candidates,
+        bm25_index=bm25_index)
 
 
 def generate_candidates_for_s1(
@@ -649,6 +662,31 @@ def _band_keys(sig, bands: int = MINHASH_BANDS, rows: int = MINHASH_ROWS):
             for i in range(bands)]
 
 
+def _build_bm25_index(df: pd.DataFrame) -> Optional["BM25Index"]:
+    """Build a word-ngram BM25 index over normalized names (recall pass).
+
+    Retries with min_df=1 when the configured min_df prunes every term on a very
+    small corpus (tests / tiny sources), and returns None if the vocabulary is
+    empty so blocking degrades gracefully instead of crashing.
+    """
+    if not USE_BM25_BLOCK or df is None or len(df) == 0:
+        return None
+    if 'name_clean' not in df.columns:
+        return None
+    texts = df['name_clean'].fillna('').astype(str).tolist()
+    ids = df[ID_COL].astype(str).tolist()
+    for min_df in (BM25_MIN_DF, 1):
+        try:
+            return BM25Index.build(
+                texts, ids, ngram_range=(1, BM25_NGRAM_MAX),
+                min_df=min_df, max_features=BM25_MAX_FEATURES,
+                k1=BM25_K1, b=BM25_B,
+            )
+        except ValueError:
+            continue
+    return None
+
+
 def build_all_indices(s2_df: pd.DataFrame, s3_df: pd.DataFrame) -> Dict[str, object]:
     """
     Compute distinctive tokens and build every inverted index for S2 and S3 once.
@@ -671,6 +709,14 @@ def build_all_indices(s2_df: pd.DataFrame, s3_df: pd.DataFrame) -> Dict[str, obj
     print(f"  S3: {len(rare_tokens_s3)} name tokens, {len(rare_addr_s3)} address "
           f"tokens, {len(rare_tri_s3)} trigrams")
 
+    bm25_s2 = None
+    bm25_s3 = None
+    if USE_BM25_BLOCK:
+        print("\nBuilding BM25 retrieval index (S2)...")
+        bm25_s2 = _build_bm25_index(s2_df)
+        print("Building BM25 retrieval index (S3)...")
+        bm25_s3 = _build_bm25_index(s3_df)
+
     print("\nBuilding S2 indices...")
     s2_indices = build_candidate_indices(
         s2_df, rare_tokens=rare_tokens_s2, rare_addr_tokens=rare_addr_s2,
@@ -684,6 +730,8 @@ def build_all_indices(s2_df: pd.DataFrame, s3_df: pd.DataFrame) -> Dict[str, obj
     return {
         's2_indices': s2_indices,
         's3_indices': s3_indices,
+        'bm25_s2': bm25_s2,
+        'bm25_s3': bm25_s3,
         'rare_tokens_s2': rare_tokens_s2,
         'rare_tokens_s3': rare_tokens_s3,
         'rare_addr_s2': rare_addr_s2,
@@ -730,10 +778,10 @@ def _block_worker(bounds: Tuple[int, int]) -> Dict[str, Set[str]]:
     for s1_id, comp in _s1_components_iter(s1_df.iloc[start:end]):
         s2_ranked = _candidates_from_components(
             comp, s2_i, bundle['rare_tokens_s2'], bundle['rare_addr_s2'],
-            bundle['rare_tri_s2'], cap)
+            bundle['rare_tri_s2'], cap, bm25_index=bundle.get('bm25_s2'))
         s3_ranked = _candidates_from_components(
             comp, s3_i, bundle['rare_tokens_s3'], bundle['rare_addr_s3'],
-            bundle['rare_tri_s3'], cap)
+            bundle['rare_tri_s3'], cap, bm25_index=bundle.get('bm25_s3'))
         out[s1_id] = _merge_ranked_sources(s2_ranked, s3_ranked, cap)
     return out
 
@@ -789,10 +837,10 @@ def generate_candidates_from_bundle(
     for s1_id, comp in iterator:
         s2_ranked = _candidates_from_components(
             comp, s2_indices, bundle['rare_tokens_s2'], bundle['rare_addr_s2'],
-            bundle['rare_tri_s2'], max_candidates)
+            bundle['rare_tri_s2'], max_candidates, bm25_index=bundle.get('bm25_s2'))
         s3_ranked = _candidates_from_components(
             comp, s3_indices, bundle['rare_tokens_s3'], bundle['rare_addr_s3'],
-            bundle['rare_tri_s3'], max_candidates)
+            bundle['rare_tri_s3'], max_candidates, bm25_index=bundle.get('bm25_s3'))
         all_candidates[s1_id] = _merge_ranked_sources(
             s2_ranked, s3_ranked, max_candidates)
 

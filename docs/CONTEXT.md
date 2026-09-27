@@ -93,7 +93,7 @@ Raw TSV Data (S1, S2, S3)
   └── Component extraction: Postal codes (5/6-digit), numbers, city tokens
         │
         ▼
-[Stage 2: 7-Pass Blocking] (`src/blocking.py`)
+[Stage 2: 8-Pass Blocking] (`src/blocking.py`)
   ├── Pass 1: Exact country + normalized name
   ├── Pass 2: Exact country + 6-char name prefix
   ├── Pass 3: Exact country + postal/PIN code
@@ -103,6 +103,8 @@ Raw TSV Data (S1, S2, S3)
   ├── Pass 6: Soundex / phonetic prefix (transliterations)
   ├── Pass 7: Relaxed name match (single-token entities)
   ├── Pass 8: Rare address tokens (connects blank-name records by address)
+  ├── Pass 9: BM25 word-n-gram top-N (`src/sparse_retrieval.py::BM25Index`)
+  │          — rewards distinctive shared name tokens; toggle `ER_USE_BM25=0`
   └── Round-robin union across blocks, capped at 100 candidates per S1
       (each block is fetched high-precision-first and capped at BLOCK_FETCH_CAP,
        so a huge block cannot starve the others of candidate slots)
@@ -186,6 +188,7 @@ All computed in `src/features.py` for each candidate pair $(S_1, S_{2/3})$:
 | **E7** | Per-Source Threshold + Singleton Barrier | 98.5% | 0.989 | 0.959 | 0.982 | ✅ Implemented | `threshold_sweep_by_source` + `sweep_singleton_barrier`; sample-scale measurement |
 | **E8** | Phonetic Blocking Index 6 (Soundex) | — | — | — | — | ✅ Implemented | 7th block now actually built |
 | **E9** | Recall Fixes: single-numeric + address-token indexes + round-robin cap | 98.5% | 0.990 | 0.963 | **0.982** | ✅ Implemented | Candidate recall 0.879 → 0.985; see `scripts/diagnose_blocking.py` |
+| **E10** | BM25 word-n-gram blocking pass (`BM25Index`, Okapi k1=1.5 b=0.75) | — | — | — | — | ✅ Implemented | Unioned into blocking; measure with `scripts/sparse_sweep.py`; `ER_USE_BM25=0` disables |
 
 ---
 

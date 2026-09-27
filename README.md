@@ -38,7 +38,7 @@ The objective is to map every clean reference record in **Source 1 (`S1`)** to a
                                      │
                                      ▼
 ┌──────────────────────────────────────────────────────────────────────────┐
-│ STAGE 2: 7-TIER INVERTED INDEX BLOCKING (`src/blocking.py`)              │
+│ STAGE 2: 8-TIER INVERTED INDEX BLOCKING (`src/blocking.py`)              │
 │  Cuts 2.2×10¹³ Cartesian pairs down to < 100 candidates per entity:      │
 │  1. Exact Name Block (country + clean name)                              │
 │  2. Name Prefix 4-gram Block (country + name prefix)                     │
@@ -47,6 +47,7 @@ The objective is to map every clean reference record in **Source 1 (`S1`)** to a
 │  5. Number + City Block (shared street numbers & city names)             │
 │  6. Soundex / Phonetic Prefix (transliteration typos)                    │
 │  7. Relaxed Name Match (single-token short entities)                     │
+│  8. BM25 Word-n-gram Top-N Pass (distinctive-token recall boost)         │
 │  → Candidate Recall: ≥ 92.4% with > 99.999% reduction ratio              │
 └────────────────────────────────────┬─────────────────────────────────────┘
                                      │
