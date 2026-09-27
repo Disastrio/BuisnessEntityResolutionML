@@ -182,6 +182,16 @@ def run_training(
     print(f"    Singletons: {blocking_metrics['singletons']:,}")
     print(f"  [time] {_elapsed(t)}")
 
+    # Do not fit a pair classifier against a candidate set that misses too many
+    # known positives. Such a model cannot recover those links, and its tuned
+    # threshold would optimize an artificially low-recall task.
+    if not blocking_metrics['gate_passed']:
+        raise RuntimeError(
+            "Candidate recall is below the 0.92 training gate "
+            f"({blocking_metrics['candidate_recall']:.4f}). Increase "
+            "--max-candidates or improve blocking, then rerun training."
+        )
+
     # ── Phase 4: Pairwise Feature Engineering ────────────────────────────
     _print_header("Phase 4: Feature Engineering")
     t = time.time()
@@ -388,12 +398,11 @@ def run_training(
             reject_mask=val_reject,
             n_workers=FEATURE_WORKERS,
         )
-        if tuned_barrier > 0:
-            print(f"  [E8] Singleton barrier adopted: {tuned_barrier} "
-                  f"(F0.5 {barrier_score:.6f})")
-            barrier = tuned_barrier
-        else:
-            barrier = SINGLETON_BARRIER
+        # Zero explicitly disables the extra barrier. Do not silently replace
+        # a validation-selected zero with the config default.
+        barrier = float(tuned_barrier)
+        print(f"  [E8] Singleton barrier selected: {barrier} "
+              f"(F0.5 {barrier_score:.6f})")
 
     # Detailed evaluation at the final tuned configuration
     val_preds = assemble_predictions(

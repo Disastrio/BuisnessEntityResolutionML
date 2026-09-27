@@ -177,9 +177,21 @@ Trains the LightGBM classifier on the training set, runs entity-level holdout va
 # Train on aligned 100k sample
 python -m src.pipeline --mode train --sample 100000
 
+# Larger, source-aware run (thresholds and singleton barrier are selected
+# on the held-out S1 entities; prediction defaults to non-competitive matching)
+python -m src.pipeline --mode train --sample 100000 --max-candidates 250 \
+    --dual-model --source-thresholds --workers 4
+python -m src.pipeline --mode predict --workers 1
+
 # Full dataset training
 python -m src.pipeline --mode train
 ```
+
+The training sweep searches thresholds through 0.995. Treat its held-out
+macro-F0.5 as an estimate, not a guarantee of leaderboard performance; the
+hidden test also contains France, which is absent from training. Compare
+`--competitive` and larger candidate caps on validation before using them for a
+final prediction.
 
 ### Mode C: Test Set Inference & Output Generation (streaming)
 Scores S1 in **chunks**, writing `output/matching_results.tsv` and

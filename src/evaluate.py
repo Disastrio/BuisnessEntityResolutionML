@@ -328,7 +328,10 @@ def threshold_sweep(
         (best_threshold, best_score, sweep_results)
     """
     if thresholds is None:
-        thresholds = [round(t, 2) for t in np.arange(0.30, 0.96, 0.01)]
+        # Include the high-confidence region. The previous grid stopped at
+        # 0.95, so a best result at that endpoint was silently censored and
+        # could not be distinguished from a genuinely optimal 0.95 threshold.
+        thresholds = [round(float(t), 3) for t in np.arange(0.30, 1.0, 0.005)]
     thresholds = [float(t) for t in thresholds]
 
     if n_workers and n_workers > 1 and hasattr(os, 'fork') and len(thresholds) >= 8:
@@ -390,7 +393,7 @@ def threshold_sweep_by_source(
         ({'S2': t2, 'S3': t3}, best_score, history)
     """
     if thresholds is None:
-        thresholds = [round(t, 2) for t in np.arange(0.30, 0.96, 0.05)]
+        thresholds = [round(float(t), 3) for t in np.arange(0.30, 1.0, 0.025)]
     thresholds = [float(t) for t in thresholds]
 
     global_t, global_score, _ = threshold_sweep(
