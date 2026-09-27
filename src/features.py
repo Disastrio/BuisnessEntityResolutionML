@@ -241,38 +241,58 @@ def _pair_features(s1c, tc) -> List[float]:
     (t_name, t_addr, t_country, t_source, t_pfx, t_len, t_alen,
      sb, gb, ab, agb, nb, pb) = tc
 
-    name_exact = 1.0 if s1_name == t_name and s1_name else 0.0
-    if s1_name and t_name:
-        name_lev = fuzz.ratio(s1_name, t_name) / 100.0
-        name_jw = distance.JaroWinkler.similarity(s1_name, t_name)
-        name_tsort = fuzz.token_sort_ratio(s1_name, t_name) / 100.0
-        name_tset = fuzz.token_set_ratio(s1_name, t_name) / 100.0
+    if s1_name == t_name and s1_name:
+        name_exact = 1.0
+        name_lev = name_jw = name_tsort = name_tset = 1.0
+        name_jacc = 1.0 if sa else 0.0
+        name_contain = 1.0 if sa else 0.0
+        name_tok_overlap = float(len(sa))
+        name_common_ratio = 1.0 if sa else 0.0
+        name_ngram = 1.0 if ga else 0.0
+        name_len_d = 0.0
+        name_pfx_match = 1.0 if s1_pfx else 0.0
     else:
-        name_lev = name_jw = name_tsort = name_tset = 0.0
+        name_exact = 0.0
+        if s1_name and t_name:
+            name_lev = fuzz.ratio(s1_name, t_name) / 100.0
+            name_jw = distance.JaroWinkler.similarity(s1_name, t_name)
+            name_tsort = fuzz.token_sort_ratio(s1_name, t_name) / 100.0
+            name_tset = fuzz.token_set_ratio(s1_name, t_name) / 100.0
+        else:
+            name_lev = name_jw = name_tsort = name_tset = 0.0
 
-    n_inter = len(sa & sb)
-    n_union = len(sa | sb)
-    # Empty evidence => 0.0 (NOT 1.0): two records with no tokens must not look
-    # like a perfect Jaccard match (false-positive merges).
-    name_jacc = n_inter / n_union if n_union else 0.0
-    n_min = min(len(sa), len(sb))
-    name_contain = n_inter / n_min if n_min else 0.0
-    name_tok_overlap = float(n_inter)
-    name_common_ratio = n_inter / n_union if n_union > 0 else 0.0
-    name_ngram = _pair_jaccard(ga, gb, bool(s1_name), bool(t_name))
-    name_len_d = abs(s1_len - t_len) / max(s1_len, t_len) if max(s1_len, t_len) else 0.0
-    name_pfx_match = 1.0 if s1_pfx == t_pfx and s1_pfx else 0.0
+        n_inter = len(sa & sb)
+        n_union = len(sa | sb)
+        # Empty evidence => 0.0 (NOT 1.0): two records with no tokens must not look
+        # like a perfect Jaccard match (false-positive merges).
+        name_jacc = n_inter / n_union if n_union else 0.0
+        n_min = min(len(sa), len(sb))
+        name_contain = n_inter / n_min if n_min else 0.0
+        name_tok_overlap = float(n_inter)
+        name_common_ratio = n_inter / n_union if n_union > 0 else 0.0
+        name_ngram = _pair_jaccard(ga, gb, bool(s1_name), bool(t_name))
+        name_len_d = abs(s1_len - t_len) / max(s1_len, t_len) if max(s1_len, t_len) else 0.0
+        name_pfx_match = 1.0 if s1_pfx == t_pfx and s1_pfx else 0.0
 
-    addr_exact = 1.0 if s1_addr == t_addr and s1_addr else 0.0
-    addr_lev = fuzz.ratio(s1_addr, t_addr) / 100.0 if s1_addr and t_addr else 0.0
-    a_inter = len(aa & ab)
-    a_union = len(aa | ab)
-    addr_tok_jacc = a_inter / a_union if a_union else 0.0
-    a_min = min(len(aa), len(ab))
-    addr_contain = a_inter / a_min if a_min else 0.0
-    addr_tok_overlap = float(a_inter)
-    addr_ngram = _pair_jaccard(aga, agb, bool(s1_addr), bool(t_addr))
-    addr_len_d = abs(s1_alen - t_alen) / max(s1_alen, t_alen) if max(s1_alen, t_alen) else 0.0
+    if s1_addr == t_addr and s1_addr:
+        addr_exact = 1.0
+        addr_lev = 1.0
+        addr_tok_jacc = 1.0 if aa else 0.0
+        addr_contain = 1.0 if aa else 0.0
+        addr_tok_overlap = float(len(aa))
+        addr_ngram = 1.0 if aga else 0.0
+        addr_len_d = 0.0
+    else:
+        addr_exact = 0.0
+        addr_lev = fuzz.ratio(s1_addr, t_addr) / 100.0 if s1_addr and t_addr else 0.0
+        a_inter = len(aa & ab)
+        a_union = len(aa | ab)
+        addr_tok_jacc = a_inter / a_union if a_union else 0.0
+        a_min = min(len(aa), len(ab))
+        addr_contain = a_inter / a_min if a_min else 0.0
+        addr_tok_overlap = float(a_inter)
+        addr_ngram = _pair_jaccard(aga, agb, bool(s1_addr), bool(t_addr))
+        addr_len_d = abs(s1_alen - t_alen) / max(s1_alen, t_alen) if max(s1_alen, t_alen) else 0.0
 
     nu_inter = len(na & nb)
     nu_union = len(na | nb)

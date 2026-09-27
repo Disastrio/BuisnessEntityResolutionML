@@ -397,7 +397,8 @@ def _rank_blocks(block_lists: List[List[str]], max_candidates: int) -> List[str]
     2) Then round-robin across blocks so a single-block true match is not starved.
     Each block is pre-truncated to BLOCK_FETCH_CAP. Deterministic.
     """
-    block_lists = [b[:BLOCK_FETCH_CAP] for b in block_lists]
+    fetch_cap = min(BLOCK_FETCH_CAP, max(120, max_candidates * 3))
+    block_lists = [b[:fetch_cap] for b in block_lists]
     hits: Dict[str, int] = {}
     best_rank: Dict[str, int] = {}
     for bi, block in enumerate(block_lists):

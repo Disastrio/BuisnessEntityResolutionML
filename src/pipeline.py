@@ -140,7 +140,7 @@ def run_training(
     print(f"  S2: {len(s2):,} records")
     print(f"  S3: {len(s3):,} records")
     print(f"  Ground truth: {len(gt):,} S1 entities")
-    print(f"  ⏱ {_elapsed(t)}")
+    print(f"  [time] {_elapsed(t)}")
 
     # ── Phase 2: Normalize ────────────────────────────────────────────────
     _print_header("Phase 2: Normalizing Records")
@@ -154,7 +154,7 @@ def run_training(
     print(f"  Normalization speed: {bench['records_per_second']:,.0f} records/sec")
     print(f"  Countries found: {bench['unique_countries']}")
     print(f"  Has postal code: {bench['has_postal_pct']}%")
-    print(f"  ⏱ {_elapsed(t)}")
+    print(f"  [time] {_elapsed(t)}")
 
     # ── Phase 3: Blocking / Candidate Generation ─────────────────────────
     _print_header("Phase 3: Candidate Generation (Blocking)")
@@ -172,13 +172,13 @@ def run_training(
     blocking_metrics = evaluate_blocking(candidates, gt)
     print(f"\n  Blocking Results:")
     print(f"    Candidate Recall: {blocking_metrics['candidate_recall']:.4f} "
-          f"({'✅ PASS' if blocking_metrics['gate_passed'] else '❌ FAIL — need >= 0.92'})")
+          f"({'[PASS]' if blocking_metrics['gate_passed'] else '[FAIL] - need >= 0.92'})")
     print(f"    Total candidates: {blocking_metrics['total_candidates']:,}")
     print(f"    Avg per S1: {blocking_metrics['avg_candidates_per_s1']:.1f}")
     print(f"    Max per S1: {blocking_metrics['max_candidates_per_s1']}")
     print(f"    True matches found: {blocking_metrics['found_true_matches']:,} / {blocking_metrics['total_true_matches']:,}")
     print(f"    Singletons: {blocking_metrics['singletons']:,}")
-    print(f"  ⏱ {_elapsed(t)}")
+    print(f"  [time] {_elapsed(t)}")
 
     # ── Phase 4: Pairwise Feature Engineering ────────────────────────────
     _print_header("Phase 4: Feature Engineering")
@@ -226,7 +226,7 @@ def run_training(
     print(f"  Positive pairs: {int(labels.sum()):,}")
     print(f"  Negative pairs: {int(len(labels) - labels.sum()):,}")
     print(f"  Positive ratio: {labels.mean():.4f}")
-    print(f"  ⏱ {_elapsed(t)}")
+    print(f"  [time] {_elapsed(t)}")
 
     # ── Phase 5: Train/Val Split & Training ──────────────────────────────
     _print_header("Phase 5: Training LightGBM Pair Classifier")
@@ -268,7 +268,7 @@ def run_training(
         model = train_lgbm(X_train, y_train, X_val, y_val,
                            sample_weight=weights_train)
         print_feature_importance(model)
-    print(f"  ⏱ {_elapsed(t)}")
+    print(f"  [time] {_elapsed(t)}")
 
     # ── Phase 6: Threshold / Rule Optimization ───────────────────────────
     _print_header("Phase 6: Threshold / Rule Optimization")
@@ -361,7 +361,7 @@ def run_training(
     for k, v in details.items():
         print(f"    {k}: {v}")
 
-    print(f"  ⏱ {_elapsed(t)}")
+    print(f"  [time] {_elapsed(t)}")
 
     # ── Phase 7: Save Model ──────────────────────────────────────────────
     _print_header("Phase 7: Saving Model")

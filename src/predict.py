@@ -179,7 +179,7 @@ def save_matching_results(
 
     df = pd.DataFrame(rows)
     df.to_csv(output_path, sep='\t', index=False, quoting=csv.QUOTE_NONE)
-    print(f"  Matching results saved → {output_path}")
+    print(f"  Matching results saved -> {output_path}")
     print(f"    Total S1 entities: {len(df)}")
     print(f"    With matches: {(df[GT_MATCH_COL] != '').sum()}")
     print(f"    Singletons: {(df[GT_MATCH_COL] == '').sum()}")
@@ -203,7 +203,7 @@ def save_candidate_pairs(
 
     df = pd.DataFrame(rows)
     df.to_csv(output_path, sep='\t', index=False, quoting=csv.QUOTE_NONE)
-    print(f"  Candidate pairs saved → {output_path}")
+    print(f"  Candidate pairs saved -> {output_path}")
     print(f"    Total S1 entities: {len(df)}")
     print(f"    Avg candidates per S1: {df[CAND_MATCH_COL].apply(lambda x: len(x.split(',')) if x else 0).mean():.1f}")
 
@@ -343,9 +343,12 @@ def run_chunked_inference(
             candidates = generate_candidates_from_bundle(
                 chunk, bundle, max_candidates=max_candidates,
                 show_progress=False, n_workers=n_workers)
+            # On Windows (no fork), avoid dumping the 10M target rows to disk on every chunk;
+            # in-memory single-thread feature calculation takes < 1 second per chunk without disk I/O.
+            feat_workers = n_workers if hasattr(os, 'fork') else 1
             features, s1_ids, target_ids = build_feature_matrix(
                 chunk, target_df, candidates,
-                show_progress=False, target_lookup=lookup, n_workers=n_workers)
+                show_progress=False, target_lookup=lookup, n_workers=feat_workers)
 
             if len(features) > 0:
                 features = features.astype(np.float32, copy=False)
@@ -491,9 +494,9 @@ def validate_output(
         errors.append(f"Missing {len(missing_cand_s1)} S1 entities in candidate_pairs")
 
     if not errors:
-        print("  ✅ Output validation PASSED")
+        print("  [PASS] Output validation PASSED")
     else:
-        print(f"  ❌ Output validation FAILED ({len(errors)} errors)")
+        print(f"  [FAIL] Output validation FAILED ({len(errors)} errors)")
         for e in errors:
             print(f"    - {e}")
 

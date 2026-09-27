@@ -406,7 +406,7 @@ def save_model(
     """Save trained model and metadata to models/ directory."""
     model_path = MODELS_DIR / f"{name}.txt"
     model.booster_.save_model(str(model_path))
-    print(f"  Model saved → {model_path}")
+    print(f"  Model saved -> {model_path}")
 
     # Save metadata
     meta = {
@@ -421,7 +421,7 @@ def save_model(
     meta_path = MODELS_DIR / f"{name}_meta.json"
     with open(meta_path, 'w') as f:
         json.dump(meta, f, indent=2)
-    print(f"  Metadata saved → {meta_path}")
+    print(f"  Metadata saved -> {meta_path}")
 
     return model_path
 
