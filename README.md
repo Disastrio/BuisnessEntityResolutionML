@@ -146,6 +146,11 @@ pip install -r requirements.txt
 
 *Key libraries: `pandas`, `numpy`, `scikit-learn`, `lightgbm`, `rapidfuzz`, `optuna`.*
 
+> **Training on a remote Linux VM?** See [docs/VM_RUNBOOK.md](docs/VM_RUNBOOK.md)
+> and the helper scripts `scripts/setup_vm.sh`, `scripts/train_vm.sh`, and
+> `scripts/predict_vm.sh`. They auto-detect cores/RAM and scale to the machine;
+> `setup_vm.sh --gpu` optionally builds CUDA LightGBM for an NVIDIA GPU.
+
 ---
 
 ## 🚀 Running the Pipeline

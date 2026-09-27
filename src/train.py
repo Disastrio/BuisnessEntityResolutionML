@@ -15,6 +15,7 @@ Supports:
 from typing import Dict, Set, List, Tuple, Optional
 from pathlib import Path
 import json
+import os
 
 import numpy as np
 import pandas as pd
@@ -34,11 +35,39 @@ from src.features import FEATURE_NAMES
 # Default LightGBM Parameters
 # ═════════════════════════════════════════════════════════════════════════════
 
+def _hardware_params() -> dict:
+    """
+    Device / thread overrides read from the environment so the same code runs
+    unchanged on CPU and on a CUDA-enabled LightGBM build.
+
+    Environment:
+        ER_LGBM_DEVICE   'cpu' (default) | 'cuda' | 'gpu'
+        ER_LGBM_THREADS  thread count (default: LightGBM uses all cores via -1)
+    """
+    params: dict = {}
+
+    device = os.environ.get('ER_LGBM_DEVICE', '').strip().lower()
+    if device in ('cuda', 'gpu'):
+        # LightGBM >= 3.3 selects the backend with `device_type`; single-precision
+        # histograms are faster and accurate enough for this feature space.
+        params['device_type'] = device
+        params['gpu_use_dp'] = False
+
+    threads = os.environ.get('ER_LGBM_THREADS')
+    if threads:
+        try:
+            params['n_jobs'] = max(1, int(threads))
+        except ValueError:
+            pass
+
+    return params
+
+
 def default_lgbm_params() -> dict:
     """
     Conservative default params optimized for precision-heavy F0.5.
     """
-    return {
+    params = {
         'objective': 'binary',
         'metric': 'binary_logloss',
         'boosting_type': 'gbdt',
@@ -59,6 +88,8 @@ def default_lgbm_params() -> dict:
         'n_jobs': -1,
         'verbose': -1,
     }
+    params.update(_hardware_params())
+    return params
 
 
 # ═════════════════════════════════════════════════════════════════════════════
