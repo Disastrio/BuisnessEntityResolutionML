@@ -312,7 +312,7 @@ def run_chunked_inference(
     # Fixed cost: target frame + blocking indices, built exactly once.
     target_df = pd.concat([s2_df, s3_df], ignore_index=True)
     lookup = TargetLookup(target_df)
-    bundle = build_all_indices(s2_df, s3_df)
+    bundle = build_all_indices(s2_df, s3_df, n_workers=n_workers)
 
     total_s1 = 0
     entities_with_matches = 0

@@ -242,11 +242,29 @@ def _key_relaxed_name(row, length: int = 4) -> List[str]:
 # Rare Token Detection (for Index 4)
 # ═════════════════════════════════════════════════════════════════════════════
 
+def _token_df_chunk(args) -> dict:
+    """Per-chunk document frequencies for one token column (worker body)."""
+    label, col, start, end = args
+    series = _TOKEN_DF_CTX['dfs'][label][col].iloc[start:end]
+    df_counts: dict = {}
+    for tokens_str in series:
+        if not tokens_str or not str(tokens_str).strip():
+            continue
+        for tok in set(str(tokens_str).split()):
+            df_counts[tok] = df_counts.get(tok, 0) + 1
+    return df_counts
+
+
+_TOKEN_DF_CTX: dict = {}
+
+
 def compute_rare_tokens(
     df: pd.DataFrame,
     min_freq: int = 2,
     max_doc_frac: float = 0.01,
     col: str = 'name_tokens',
+    n_workers: int = 1,
+    label: str = '',
 ) -> Set[str]:
     """
     Find tokens that appear in at least min_freq documents but in at most
@@ -255,16 +273,31 @@ def compute_rare_tokens(
 
     `col` selects the token column ('name_tokens' or 'addr_clean'); address
     blocking reuses this to find distinctive street/area tokens.
-    """
-    doc_freq = defaultdict(int)
-    n_docs = len(df)
 
-    for tokens_str in df[col]:
-        if not tokens_str or str(tokens_str).strip() == '':
-            continue
-        unique_tokens = set(str(tokens_str).split())
-        for tok in unique_tokens:
-            doc_freq[tok] += 1
+    With ``n_workers > 1`` (fork only) the document-frequency scan is split
+    across processes and merged, removing the single-threaded pass over ~10M
+    rows that otherwise dominates index-build time.
+    """
+    n_docs = len(df)
+    doc_freq: Dict[str, int] = {}
+
+    if n_workers and n_workers > 1 and hasattr(os, 'fork') and n_docs >= 50_000:
+        global _TOKEN_DF_CTX
+        _TOKEN_DF_CTX = {'dfs': {label: {col: df[col]}}}
+        bounds = np.linspace(0, n_docs, int(n_workers) + 1).astype(int)
+        tasks = [(label, col, int(bounds[i]), int(bounds[i + 1]))
+                 for i in range(len(bounds) - 1) if bounds[i] < bounds[i + 1]]
+        with mp.get_context('fork').Pool(processes=len(tasks)) as pool:
+            for part in pool.imap_unordered(_token_df_chunk, tasks):
+                for tok, c in part.items():
+                    doc_freq[tok] = doc_freq.get(tok, 0) + c
+    else:
+        for tokens_str in df[col]:
+            if not tokens_str or str(tokens_str).strip() == '':
+                continue
+            unique_tokens = set(str(tokens_str).split())
+            for tok in unique_tokens:
+                doc_freq[tok] = doc_freq.get(tok, 0) + 1
 
     max_count = max(1, int(n_docs * max_doc_frac))
     rare = {
@@ -278,11 +311,134 @@ def compute_rare_tokens(
 # Main Blocking Engine
 # ═════════════════════════════════════════════════════════════════════════════
 
+def _index_build_chunk(args) -> dict:
+    """
+    Build partial inverted indices for a contiguous row slice (worker body).
+
+    Returns {index_name: {key: [ids]}} for the slice; the parent merges lists
+    in row order so the result is identical to the serial single pass.
+    """
+    start, end = args
+    df = _INDEX_BUILD_CTX['df'].iloc[start:end]
+    rare_tokens = _INDEX_BUILD_CTX['rare_tokens']
+    rare_addr_tokens = _INDEX_BUILD_CTX['rare_addr_tokens']
+    rare_trigrams = _INDEX_BUILD_CTX['rare_trigrams']
+
+    idx = {name: defaultdict(list) for name in (
+        'exact_name', 'name_prefix', 'postal', 'rare_tokens', 'addr_numerics',
+        'soundex', 'num_single', 'addr_rare', 'trigram', 'relaxed_name',
+        'tokenset', 'postal3', 'minhash')}
+
+    ids = df[ID_COL].to_numpy()
+    names = df['name_clean'].to_numpy()
+    countries = df['country_clean'].to_numpy()
+    postals = df['addr_postal'].to_numpy()
+    numerics = df['addr_numeric'].to_numpy()
+    tokens_col = df['name_tokens'].to_numpy()
+    addrs = df['addr_clean'].to_numpy()
+    use_rt = bool(rare_tokens)
+    use_ra = bool(rare_addr_tokens)
+    use_tri = bool(rare_trigrams)
+
+    for i in range(len(ids)):
+        eid = ids[i]
+        country = str(countries[i]).strip()
+        name = str(names[i]).strip()
+        if name:
+            idx['exact_name'][f"{country}|{name}"].append(eid)
+            cname = _strip_the(name)
+            if len(cname) >= 3:
+                idx['name_prefix'][f"{country}|pfx|{cname[:6]}"].append(eid)
+                idx['relaxed_name'][f"{country}|rel|{cname[:4]}"].append(eid)
+            if USE_PHONETIC_BLOCK:
+                code = soundex(cname.split()[0], SOUNDEX_LENGTH) if cname else ''
+                if code:
+                    idx['soundex'][f"{country}|sndx|{code}"].append(eid)
+            if use_tri:
+                for gram in _trigrams(name):
+                    if gram in rare_trigrams:
+                        idx['trigram'][f"{country}|tri|{gram}"].append(eid)
+            ts = str(tokens_col[i]).strip()
+            if ts:
+                idx['tokenset'][
+                    f"{country}|tset|{'_'.join(sorted(ts.split()))}"].append(eid)
+            if USE_MINHASH_LSH:
+                sig = _minhash_signature(_shingle_hashes(name))
+                if sig is not None:
+                    for bk in _band_keys(sig):
+                        idx['minhash'][f"{country}|mh|{bk}"].append(eid)
+        if use_rt:
+            ts = str(tokens_col[i]).strip()
+            if ts:
+                for tok in ts.split():
+                    if tok in rare_tokens and len(tok) >= 3:
+                        idx['rare_tokens'][f"{country}|rtok|{tok}"].append(eid)
+        postal = str(postals[i]).strip()
+        if postal:
+            for code in postal.split(','):
+                code = code.strip()
+                if code:
+                    idx['postal'][f"{country}|post|{code}"].append(eid)
+                    if len(code) >= 3:
+                        idx['postal3'][f"{country}|post3|{code[:3]}"].append(eid)
+        nums = str(numerics[i]).strip()
+        if nums:
+            numset = set(nums.split())
+            num_list = sorted(numset)
+            if len(num_list) >= 2:
+                idx['addr_numerics'][
+                    f"{country}|nums|{'_'.join(num_list[:3])}"].append(eid)
+            for tok in numset:
+                if len(tok) >= 3:
+                    idx['num_single'][f"{country}|num|{tok}"].append(eid)
+        if use_ra:
+            addr = str(addrs[i]).strip()
+            if addr:
+                for tok in set(addr.split()):
+                    if tok in rare_addr_tokens and len(tok) >= 3:
+                        idx['addr_rare'][f"{country}|atok|{tok}"].append(eid)
+    return idx
+
+
+_INDEX_BUILD_CTX: dict = {}
+
+
+def _build_candidate_indices_parallel(
+    target_df: pd.DataFrame,
+    rare_tokens: Optional[Set[str]],
+    rare_addr_tokens: Optional[Set[str]],
+    rare_trigrams: Optional[Set[str]],
+    n_workers: int,
+) -> Dict[str, Dict[str, List[str]]]:
+    """Chunked parallel build; merged in row order -> identical to serial."""
+    n = len(target_df)
+    global _INDEX_BUILD_CTX
+    _INDEX_BUILD_CTX = {
+        'df': target_df.reset_index(drop=True),
+        'rare_tokens': rare_tokens,
+        'rare_addr_tokens': rare_addr_tokens,
+        'rare_trigrams': rare_trigrams,
+    }
+    bounds = np.linspace(0, n, int(n_workers) + 1).astype(int)
+    ranges = [(int(bounds[i]), int(bounds[i + 1]))
+              for i in range(len(bounds) - 1) if bounds[i] < bounds[i + 1]]
+
+    merged: Dict[str, Dict[str, list]] = {}
+    with mp.get_context('fork').Pool(processes=len(ranges)) as pool:
+        for part in pool.imap(_index_build_chunk, ranges):
+            for idx_name, d in part.items():
+                dst = merged.setdefault(idx_name, {})
+                for key, lst in d.items():
+                    dst.setdefault(key, []).extend(lst)
+    return _freeze_indices(merged)
+
+
 def build_candidate_indices(
     target_df: pd.DataFrame,
     rare_tokens: Optional[Set[str]] = None,
     rare_addr_tokens: Optional[Set[str]] = None,
     rare_trigrams: Optional[Set[str]] = None,
+    n_workers: int = 1,
 ) -> Dict[str, Dict[str, List[str]]]:
     """
     Build all inverted indices for a target source (S2 or S3).
@@ -292,11 +448,20 @@ def build_candidate_indices(
         rare_tokens: Distinctive name tokens (Index 4).
         rare_addr_tokens: Distinctive address tokens (Index 8) — lets pairs
             connect on address alone, which matters when the noisy name is blank.
+        n_workers: With >1 (fork only) and >=500k rows, the single-pass build is
+            chunked across processes and merged in row order, which is identical
+            to the serial result but scales with cores.
 
     Returns:
         Dict with index names as keys and inverted indices as values.
     """
-    indices = {}
+    if (n_workers and n_workers > 1 and hasattr(os, 'fork')
+            and len(target_df) >= 500_000):
+        print(f"  Building all indices in parallel over {len(target_df):,} "
+              f"rows (workers={n_workers})...")
+        return _build_candidate_indices_parallel(
+            target_df, rare_tokens, rare_addr_tokens, rare_trigrams,
+            int(n_workers))
 
     idx = {name: defaultdict(list) for name in (
         'exact_name', 'name_prefix', 'postal', 'rare_tokens', 'addr_numerics',
@@ -377,6 +542,11 @@ def build_candidate_indices(
 
     # Freeze and drop super-keys: buckets larger than MAX_BUCKET_IDS are too
     # generic to discriminate and dominate ranking cost / noise.
+    return _freeze_indices(idx)
+
+
+def _freeze_indices(idx: Dict[str, Dict[str, list]]) -> Dict[str, Dict[str, List[str]]]:
+    """Drop super-keys (> MAX_BUCKET_IDS) and return plain-dict indices."""
     indices = {}
     dropped = 0
     for name, d in idx.items():
@@ -604,11 +774,28 @@ def _trigrams(text: str, n: int = 3) -> Set[str]:
     return {s[i:i + n] for i in range(len(s) - n + 1)}
 
 
+def _trigram_df_chunk(args) -> dict:
+    """Per-chunk trigram document frequencies (worker body)."""
+    start, end = args
+    series = _TRIGRAM_DF_CTX['col'].iloc[start:end]
+    counts: dict = {}
+    for name in series:
+        if not name:
+            continue
+        for gram in _trigrams(name):
+            counts[gram] = counts.get(gram, 0) + 1
+    return counts
+
+
+_TRIGRAM_DF_CTX: dict = {}
+
+
 def compute_rare_trigrams(
     df: pd.DataFrame,
     col: str = 'name_clean',
     min_freq: int = 2,
     max_doc_frac: float = 0.02,
+    n_workers: int = 1,
 ) -> Set[str]:
     """
     Distinctive character trigrams (document frequency in [min_freq, max_frac]).
@@ -616,14 +803,28 @@ def compute_rare_trigrams(
     Common trigrams ('the', 'ing') are excluded so the inverted index stays
     small; rare trigrams are highly discriminative and recover name variants
     (typos, transliterations) that prefix/soundex blocks miss.
+
+    With ``n_workers > 1`` (fork only) the scan is chunked and merged.
     """
-    doc_freq: Dict[str, int] = defaultdict(int)
     n_docs = len(df)
-    for name in df[col]:
-        if not name:
-            continue
-        for gram in _trigrams(name):
-            doc_freq[gram] += 1
+    doc_freq: Dict[str, int] = {}
+
+    if n_workers and n_workers > 1 and hasattr(os, 'fork') and n_docs >= 50_000:
+        global _TRIGRAM_DF_CTX
+        _TRIGRAM_DF_CTX = {'col': df[col]}
+        bounds = np.linspace(0, n_docs, int(n_workers) + 1).astype(int)
+        tasks = [(int(bounds[i]), int(bounds[i + 1]))
+                 for i in range(len(bounds) - 1) if bounds[i] < bounds[i + 1]]
+        with mp.get_context('fork').Pool(processes=len(tasks)) as pool:
+            for part in pool.imap_unordered(_trigram_df_chunk, tasks):
+                for gram, c in part.items():
+                    doc_freq[gram] = doc_freq.get(gram, 0) + c
+    else:
+        for name in df[col]:
+            if not name:
+                continue
+            for gram in _trigrams(name):
+                doc_freq[gram] = doc_freq.get(gram, 0) + 1
     max_count = max(1, int(n_docs * max_doc_frac))
     return {g for g, f in doc_freq.items() if min_freq <= f <= max_count}
 
@@ -687,25 +888,36 @@ def _build_bm25_index(df: pd.DataFrame) -> Optional["BM25Index"]:
     return None
 
 
-def build_all_indices(s2_df: pd.DataFrame, s3_df: pd.DataFrame) -> Dict[str, object]:
+def build_all_indices(
+    s2_df: pd.DataFrame,
+    s3_df: pd.DataFrame,
+    n_workers: int = 1,
+) -> Dict[str, object]:
     """
     Compute distinctive tokens and build every inverted index for S2 and S3 once.
 
     Returns a bundle that can be reused across many S1 chunks, so streaming
     inference pays the (expensive) index-build cost a single time instead of
-    per chunk.
+    per chunk. With ``n_workers > 1`` (fork only) the token-frequency scans and
+    the inverted-index builds are chunked across processes.
     """
     print("Computing distinctive tokens for S2...")
-    rare_tokens_s2 = compute_rare_tokens(s2_df, col='name_tokens')
-    rare_addr_s2 = compute_rare_tokens(s2_df, col='addr_clean')
-    rare_tri_s2 = compute_rare_trigrams(s2_df) if USE_TRIGRAM_BLOCK else set()
+    rare_tokens_s2 = compute_rare_tokens(s2_df, col='name_tokens',
+                                         n_workers=n_workers, label='S2')
+    rare_addr_s2 = compute_rare_tokens(s2_df, col='addr_clean',
+                                       n_workers=n_workers, label='S2')
+    rare_tri_s2 = (compute_rare_trigrams(s2_df, n_workers=n_workers)
+                   if USE_TRIGRAM_BLOCK else set())
     print(f"  S2: {len(rare_tokens_s2)} name tokens, {len(rare_addr_s2)} address "
           f"tokens, {len(rare_tri_s2)} trigrams")
 
     print("Computing distinctive tokens for S3...")
-    rare_tokens_s3 = compute_rare_tokens(s3_df, col='name_tokens')
-    rare_addr_s3 = compute_rare_tokens(s3_df, col='addr_clean')
-    rare_tri_s3 = compute_rare_trigrams(s3_df) if USE_TRIGRAM_BLOCK else set()
+    rare_tokens_s3 = compute_rare_tokens(s3_df, col='name_tokens',
+                                         n_workers=n_workers, label='S3')
+    rare_addr_s3 = compute_rare_tokens(s3_df, col='addr_clean',
+                                       n_workers=n_workers, label='S3')
+    rare_tri_s3 = (compute_rare_trigrams(s3_df, n_workers=n_workers)
+                   if USE_TRIGRAM_BLOCK else set())
     print(f"  S3: {len(rare_tokens_s3)} name tokens, {len(rare_addr_s3)} address "
           f"tokens, {len(rare_tri_s3)} trigrams")
 
@@ -720,12 +932,12 @@ def build_all_indices(s2_df: pd.DataFrame, s3_df: pd.DataFrame) -> Dict[str, obj
     print("\nBuilding S2 indices...")
     s2_indices = build_candidate_indices(
         s2_df, rare_tokens=rare_tokens_s2, rare_addr_tokens=rare_addr_s2,
-        rare_trigrams=rare_tri_s2)
+        rare_trigrams=rare_tri_s2, n_workers=n_workers)
 
     print("\nBuilding S3 indices...")
     s3_indices = build_candidate_indices(
         s3_df, rare_tokens=rare_tokens_s3, rare_addr_tokens=rare_addr_s3,
-        rare_trigrams=rare_tri_s3)
+        rare_trigrams=rare_tri_s3, n_workers=n_workers)
 
     return {
         's2_indices': s2_indices,
@@ -864,7 +1076,7 @@ def generate_all_candidates(
     Returns:
         Dict: {s1_id: set(candidate_s2_s3_ids)}
     """
-    bundle = build_all_indices(s2_df, s3_df)
+    bundle = build_all_indices(s2_df, s3_df, n_workers=n_workers)
     print(f"\nGenerating candidates for {len(s1_df)} S1 entities "
           f"(workers={n_workers})...")
     return generate_candidates_from_bundle(

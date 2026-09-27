@@ -87,13 +87,18 @@ if [ "$BUILD_GPU" -eq 1 ]; then
     echo "--------------------------------------------------------------"
     if [ -z "$GPU_NAME" ]; then
         echo "[warn] no NVIDIA GPU detected; skipping the GPU build."
-    elif ! command -v nvcc >/dev/null 2>&1 && [ ! -x /usr/local/cuda/bin/nvcc ]; then
-        echo "[warn] nvcc not found. Install the CUDA toolkit (e.g. sudo apt-get install nvidia-cuda-toolkit)"
+    elif ! python -c "import torch" 2>/dev/null && \
+         [ ! -x /usr/local/cuda/bin/nvcc ] && \
+         ! ls /usr/local/cuda-*/bin/nvcc >/dev/null 2>&1 && \
+         ! command -v nvcc >/dev/null 2>&1; then
+        echo "[warn] nvcc not found. Install the CUDA toolkit:"
+        echo "       sudo apt-get install -y nvidia-cuda-toolkit   # or the matching cuda-toolkit-XX"
         echo "[warn] skipping the GPU build; CPU LightGBM remains installed."
     elif ! command -v cmake >/dev/null 2>&1; then
         echo "[warn] cmake not found (sudo apt-get install cmake); skipping the GPU build."
     else
-        export CUDACXX="${CUDACXX:-$(command -v nvcc || echo /usr/local/cuda/bin/nvcc)}"
+        CUDACXX_TMP="$(command -v nvcc || ls /usr/local/cuda-*/bin/nvcc 2>/dev/null | tail -1 || echo /usr/local/cuda/bin/nvcc)"
+        export CUDACXX="${CUDACXX:-$CUDACXX_TMP}"
         SRC=/tmp/LightGBM-v4.7.0
         set +e
         rm -rf "$SRC"
